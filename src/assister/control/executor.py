@@ -23,6 +23,7 @@ SM_VIRTUAL_SCREEN = (76, 77, 78, 79)  # 왼쪽, 위, 너비, 높이
 MAX_WAIT_SEC = 5
 TYPE_GAP_SEC = 0.005
 DOUBLE_CLICK_GAP_SEC = 0.06
+OPEN_POLL_SEC, OPEN_TRIES = 0.2, 20  # 연 프로그램의 창이 뜨기까지 최대 4초 기다린다
 
 VIRTUAL_KEYS = {
     "enter": 0x0D, "tab": 0x09, "space": 0x20, "backspace": 0x08, "delete": 0x2E,
@@ -95,6 +96,32 @@ def _key(code: int, flags: int = 0, *, scan: int = 0) -> _Input:
     return _Input(type=INPUT_KEYBOARD, keyboard=_KeyboardInput(code, scan, flags, 0, 0))
 
 
+def _titled_windows() -> list[int]:
+    """화면에 보이고 제목이 있는 창들의 핸들. 앞에 있는 것부터."""
+    user32 = ctypes.windll.user32
+    found: list[int] = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def visit(hwnd, _lparam):
+        if user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd):
+            found.append(hwnd)
+        return True
+
+    user32.EnumWindows(visit, 0)
+    return found
+
+
+def _bring_forward(hwnd: int) -> None:
+    """창을 맨 앞에 세운다.
+
+    Alt를 한 번 눌렀다 떼야 Windows가 다른 프로그램의 창을 앞에 세우게 해 준다
+    (AttachThreadInput, SwitchToThisWindow는 이 PC에서 통하지 않았다).
+    """
+    alt = VIRTUAL_KEYS["alt"]
+    _send(_key(alt), _key(alt, KEY_UP))
+    ctypes.windll.user32.SetForegroundWindow(hwnd)
+
+
 class Win32Executor:
     def monitors(self) -> list[tuple[int, int, int, int]]:
         return monitor_rects()
@@ -121,11 +148,28 @@ class Win32Executor:
             codes = [virtual_key(name) for name in action.keys.split("+")]
             _send(*(_key(code) for code in codes), *(_key(code, KEY_UP) for code in reversed(codes)))
         elif action.kind == "open":
-            os.startfile(action.text)  # noqa: S606 (무엇을 열어도 되는지는 risk_reason이 먼저 가려낸다)
+            self._open(action.text)
         elif action.kind == "wait":
             time.sleep(min(max(action.amount, 1), MAX_WAIT_SEC))
         else:
             raise ActionError(f"실행할 수 없는 동작입니다: {action.kind}")
+
+    def _open(self, name: str) -> None:
+        """프로그램을 열고 새로 뜬 창을 맨 앞에 세운다.
+
+        이 앱이 맨 앞이 아닐 때 연 프로그램은 뒤에 뜬다(실제로 재 보니 계산기가 4초 뒤에도 뒤에 있었다).
+        그대로 두면 이어지는 글자 입력이 사용자가 쓰던 창으로 들어간다.
+        """
+        before = set(_titled_windows())
+        os.startfile(name)  # noqa: S606 (무엇을 열어도 되는지는 risk_reason이 먼저 가려낸다)
+        # ponytail: 이미 떠 있던 프로그램이 새 창 없이 받으면(브라우저 탭 등) 앞에 세우지 못한다.
+        # 그런 일이 생기면 프로세스 이름으로 창을 찾는다.
+        for _ in range(OPEN_TRIES):
+            time.sleep(OPEN_POLL_SEC)
+            new = [hwnd for hwnd in _titled_windows() if hwnd not in before]
+            if new:
+                _bring_forward(new[0])
+                return
 
     def _move(self, point: tuple[int, int]) -> None:
         metrics = ctypes.windll.user32.GetSystemMetrics

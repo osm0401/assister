@@ -3,6 +3,7 @@ import threading
 import pytest
 
 from assister.ai.engine import EngineError
+from assister.control import executor
 from assister.control.actions import (
     ACTION_FORMAT,
     Action,
@@ -54,6 +55,27 @@ def test_unused_fields_filled_with_blanks_are_ignored():
 def test_unusable_actions_are_rejected(raw):
     with pytest.raises(ActionError):
         parse_action(raw)
+
+
+def test_opening_a_program_brings_its_new_window_forward(monkeypatch):
+    # 이 앱이 맨 앞이 아닐 때 연 프로그램은 뒤에 떠서, 이어지는 글자 입력이 쓰던 창으로 들어갔다.
+    looks = iter([[1, 2], [1, 2], [7, 1, 2]])
+    done = []
+    monkeypatch.setattr(executor, "_titled_windows", lambda: next(looks))
+    monkeypatch.setattr(executor.os, "startfile", done.append)
+    monkeypatch.setattr(executor, "_bring_forward", done.append)
+    monkeypatch.setattr(executor.time, "sleep", lambda _seconds: None)
+
+    executor.Win32Executor().perform(Action("open", "x", text="calc"), None)
+
+    assert done == ["calc", 7]
+
+
+def test_open_takes_the_program_name_from_target_when_text_is_empty():
+    # 실제 모델이 프로그램 이름을 target 칸에 적고 text를 비운 적이 있다.
+    action = parse_action({"action": "open", "why": "x", "target": " calc ", "text": ""})
+
+    assert (action.kind, action.text) == ("open", "calc")
 
 
 def test_ai_must_fill_every_field_so_clicks_always_come_with_coordinates():

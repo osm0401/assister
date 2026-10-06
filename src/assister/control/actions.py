@@ -125,6 +125,8 @@ def parse_action(raw: object) -> Action:
         )  # fmt: skip
     if kind in ("type", "open"):
         text = raw.get("text")
+        if kind == "open" and not (isinstance(text, str) and text.strip()):
+            text = raw.get("target")  # 모델이 프로그램 이름을 target 칸에 적을 때가 있다
         if not isinstance(text, str) or not text.strip():
             raise ActionError(f"{kind}에는 text가 필요합니다")
         return Action(kind, why, text=text if kind == "type" else text.strip(), risky=risky)
