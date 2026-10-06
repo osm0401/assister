@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# 내 PC에만 두는 데이터 (기억, 설정, 화면 기록)
+data/
+bench/out/

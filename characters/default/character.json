@@ -1,0 +1,32 @@
+{
+  "name": "모모",
+  "default_outfit": "basic",
+  "outfits": {
+    "basic": {
+      "label": "주황 후드",
+      "unlock_level": 1
+    },
+    "cardigan": {
+      "label": "하늘 가디건",
+      "unlock_level": 2
+    },
+    "dress": {
+      "label": "분홍 원피스",
+      "unlock_level": 4
+    }
+  },
+  "props": {
+    "ribbon": {
+      "label": "리본",
+      "unlock_level": 2
+    },
+    "glasses": {
+      "label": "안경",
+      "unlock_level": 3
+    },
+    "headphones": {
+      "label": "헤드폰",
+      "unlock_level": 5
+    }
+  }
+}

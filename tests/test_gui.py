@@ -1,0 +1,887 @@
+from datetime import datetime, timedelta
+
+import pytest
+from PySide6.QtCore import QObject, QPoint, Signal
+
+from assister import app as app_module
+from assister import paths
+from assister.ai.engine import EngineError
+from assister.character.art import generate_placeholder_pack
+from assister.character.bubble import MAX_SHOW_MS, MAX_TEXT_WIDTH, MIN_SHOW_MS, show_duration_ms
+from assister.character.pack import load_pack
+from assister.character.stage import THINKING_TEXT, CharacterStage
+from assister.config import Settings, load_settings, save_settings
+from assister.system.hotkey import HotkeyError
+
+# ---------- 캐릭터 창, 말풍선, 입력창 ----------
+
+
+@pytest.fixture
+def pack(tmp_path):
+    return load_pack(generate_placeholder_pack(tmp_path / "characters" / "default"))
+
+
+@pytest.fixture
+def stage(qapp, pack):
+    stage = CharacterStage(pack, "basic", 320)
+    stage.show(None)
+    yield stage
+    stage.close()
+
+
+def test_character_is_drawn_at_requested_height(stage):
+    assert stage.character.height() == 320
+    assert stage.character.width() == 240  # 480x640 그림의 비율 유지
+
+
+def test_character_window_has_transparent_background(stage):
+    image = stage.character.grab().toImage()
+
+    assert image.pixelColor(2, 2).alpha() == 0
+    assert image.pixelColor(image.width() // 2, image.height() // 2).alpha() == 255
+
+
+def test_saying_shows_bubble_above_and_changes_expression(stage):
+    stage.say("안녕하세요!", "smile")
+
+    assert stage.bubble.isVisible()
+    assert stage.character.expression == "smile"
+    assert stage.bubble.geometry().bottom() <= stage.character.geometry().top()
+
+
+def test_expression_returns_to_neutral_after_bubble_closes(qapp, stage):
+    stage.say("안녕하세요!", "smile")
+
+    stage.bubble.dismiss()
+    qapp.processEvents()
+
+    assert stage.character.expression == "neutral"
+
+
+def test_thinking_then_streaming_keeps_one_bubble_open_until_released(qapp, stage):
+    stage.think()
+    assert stage.bubble.text == THINKING_TEXT
+    assert stage.character.expression == "thinking"
+
+    stage.stream("안녕")
+    stage.stream("안녕하세요!")
+    assert stage.bubble.text == "안녕하세요!"
+    assert stage.character.expression == "talking"
+    assert not stage.bubble._timer.isActive()  # 글이 나오는 동안에는 사라지지 않는다
+
+    stage.release()
+    assert stage.bubble._timer.isActive()
+
+
+def test_input_bar_sits_below_character_and_emits_text(stage):
+    received = []
+    stage.submitted.connect(received.append)
+    edit = stage.input_bar._edit
+
+    edit.setText("  할 일 목록  ")
+    edit.returnPressed.emit()
+
+    assert stage.input_bar.isVisible()
+    assert stage.input_bar.geometry().top() >= stage.character.geometry().bottom()
+    assert received == ["할 일 목록"]
+    assert edit.text() == ""
+
+
+def test_mic_button_asks_to_listen_and_shows_what_the_microphone_is_doing(stage):
+    clicks = []
+    stage.mic_clicked.connect(lambda: clicks.append(True))
+
+    stage.input_bar._mic.click()
+    stage.input_bar.set_mic_state("hearing")
+
+    assert clicks == [True]
+    assert stage.input_bar.mic_state == "hearing"
+    assert "듣는 중" in stage.input_bar._mic.toolTip()
+
+
+def test_heard_words_are_shown_briefly_in_the_input_bar(stage):
+    stage.input_bar.show_heard("불 켜 줘")
+
+    assert "불 켜 줘" in stage.input_bar._edit.placeholderText()
+
+
+def test_changing_outfit_and_props_redraws(stage):
+    before = stage.character.grab().toImage()
+
+    stage.character.set_outfit("dress")
+    stage.character.set_props(("glasses",))
+
+    assert stage.character.grab().toImage() != before
+
+
+def test_short_text_stays_on_one_line_and_long_text_wraps(stage):
+    label = stage.bubble._label
+    line_height = label.fontMetrics().lineSpacing()
+
+    stage.say("안녕하세요, 모모예요!")
+    assert label.width() >= label.fontMetrics().horizontalAdvance("안녕하세요, 모모예요!")
+    assert label.height() < line_height * 2
+
+    stage.say("가나다라마바사 " * 20)
+    assert label.height() > line_height * 2
+    assert label.width() <= MAX_TEXT_WIDTH
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [("짧은 말", MIN_SHOW_MS), ("가" * 100, 9000), ("가" * 1000, MAX_SHOW_MS)],
+)
+def test_longer_text_stays_longer(text, expected):
+    assert show_duration_ms(text) == expected
+
+
+# ---------- 앱 전체 (AI, 목소리, 마이크는 흉내) ----------
+
+
+class FakeEngine:
+    def __init__(self, *, plans=(), replies=(), fail_with: EngineError | None = None):
+        self.plans = list(plans)
+        self.replies = list(replies)
+        self.fail_with = fail_with
+        self.warmed = 0
+        self.asked: list[str] = []
+
+    def warm_up(self):
+        self.warmed += 1
+        if self.fail_with:
+            raise self.fail_with
+
+    def complete_json(self, messages, schema):
+        if self.fail_with:
+            raise self.fail_with
+        return self.plans.pop(0) if self.plans else {"actions": []}
+
+    def chat(self, messages, *, on_delta=None, should_stop=None):
+        if self.fail_with:
+            raise self.fail_with
+        self.asked.append(messages[-1]["content"])
+        reply = self.replies.pop(0) if self.replies else "네!"
+        if on_delta:
+            # 실제 엔진처럼 여러 조각으로 나눠 보낸다.
+            middle = len(reply) // 2
+            on_delta(reply[:middle])
+            on_delta(reply[middle:])
+        return reply
+
+    def close(self):
+        pass
+
+
+class FakeSpeaker(QObject):
+    started = Signal()
+    finished = Signal()
+    failed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.said: list[str] = []
+        self.stops = 0
+
+    def say(self, text):
+        self.said.append(text)
+
+    def stop(self):
+        self.stops += 1
+
+    def shutdown(self):
+        pass
+
+
+class FakeListener(QObject):
+    heard = Signal(str, str)
+    state_changed = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.running = False
+        self.armed = 0
+        self.paused = False
+        self.wake_enabled: bool | None = None
+
+    def start(self):
+        self.running = True
+
+    def set_wake_enabled(self, enabled):
+        self.wake_enabled = enabled
+
+    def arm(self):
+        self.armed += 1
+
+    def pause(self):
+        self.paused = True
+
+    def resume(self):
+        self.paused = False
+
+    def shutdown(self):
+        self.running = False
+
+
+class FakeWatcher(QObject):
+    noted = Signal(str, str)
+    state_changed = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.running = False
+        self.enabled: bool | None = None
+
+    def start(self):
+        self.running = True
+
+    def set_enabled(self, enabled):
+        self.enabled = enabled
+
+    def shutdown(self):
+        self.running = False
+
+
+class FakeAgent(QObject):
+    started = Signal(str)
+    step = Signal(str)
+    confirm_needed = Signal(str)
+    finished = Signal(str, bool)
+
+    def __init__(self):
+        super().__init__()
+        self.goals: list[str] = []
+        self.answers: list[bool] = []
+        self.stops = 0
+        self.running = False
+
+    def run(self, goal):
+        self.goals.append(goal)
+        return True
+
+    def stop(self):
+        self.stops += 1
+
+    def answer(self, allowed):
+        self.answers.append(allowed)
+
+    def join(self, timeout=3.0):
+        pass
+
+
+class FakeHotkey(QObject):
+    """실제로 키를 가로채지 않는 단축키. 테스트에서 pressed를 직접 보낸다."""
+
+    pressed = Signal()
+    made: list["FakeHotkey"] = []
+
+    def __init__(self, text, parent=None, *, allow_bare=False):
+        super().__init__(parent)
+        self.text, self.allow_bare, self.released = text, allow_bare, False
+        FakeHotkey.made.append(self)
+
+    def release(self):
+        self.released = True
+
+
+@pytest.fixture
+def make_friend(qapp, tmp_path, monkeypatch, wait_until):
+    monkeypatch.setenv(paths.DATA_DIR_ENV, str(tmp_path / "data"))
+    monkeypatch.setattr(paths, "characters_dir", lambda: tmp_path / "characters")
+
+    def refuse_hotkey(*_args, **_kwargs):
+        raise HotkeyError("테스트에서는 전역 단축키를 등록하지 않습니다")
+
+    monkeypatch.setattr(app_module, "GlobalHotkey", refuse_hotkey)
+    # 진짜 시작프로그램 폴더를 건드리지 않는다.
+    monkeypatch.setattr(app_module.autostart, "startup_folder", lambda: tmp_path / "Startup")
+    friends = []
+
+    def make(engine=None, *, settings: Settings | None = None, wait_ready: bool = True):
+        if settings is not None:
+            save_settings(paths.settings_path(), settings)
+        friend = app_module.DesktopFriend(
+            qapp,
+            engine=engine or FakeEngine(),
+            speaker=FakeSpeaker(),
+            listener=FakeListener(),
+            watcher=FakeWatcher(),
+            agent=FakeAgent(),
+        )
+        friend.start()
+        friends.append(friend)
+        if wait_ready:
+            # 모델이 올라왔다는 신호가 화면 스레드에 닿을 때까지 기다린다.
+            assert wait_until(lambda: friend._model_ready)
+        return friend
+
+    yield make
+    for friend in friends:
+        friend.shutdown()
+
+
+def bubble_text(friend) -> str:
+    return friend.stage.bubble.text
+
+
+def test_app_starts_with_generated_character_greets_and_wakes_the_model(make_friend, wait_until, tmp_path):
+    engine = FakeEngine()
+
+    friend = make_friend(engine)
+
+    assert (tmp_path / "characters" / "default" / "outfits" / "basic" / "neutral.png").exists()
+    assert "안녕하세요" in bubble_text(friend)
+    # 단축키 등록이 실패해도 앱은 뜨고, 이유를 알려 준다.
+    assert "단축키" in bubble_text(friend)
+    assert wait_until(lambda: engine.warmed == 1)
+    assert friend.listener.running
+
+
+def test_greeting_mentions_what_is_left_to_do_today(make_friend, tmp_path):
+    from assister.tasks.repository import TaskRepository
+
+    now = datetime.now()
+    seeded = TaskRepository(tmp_path / "data" / "tasks.db")
+    seeded.add_todo("우유 사기", now)
+    seeded.add_todo("메일 답장", now)
+    seeded.add_alarm("회의", now + timedelta(hours=1))
+    seeded.close()
+
+    friend = make_friend()
+
+    assert "할 일 2개" in friend._greeting() and "알람 1개" in friend._greeting()
+
+
+def test_greeting_stays_short_when_nothing_is_pending(make_friend):
+    friend = make_friend()
+
+    assert friend._greeting() == "안녕하세요, 모모예요!"
+
+
+def test_typed_talk_is_answered_by_the_ai_and_remembered(make_friend, wait_until):
+    engine = FakeEngine(replies=["저도 반가워요!"])
+    friend = make_friend(engine)
+
+    friend.stage.submitted.emit("안녕, 반가워")
+
+    assert friend.stage.character.expression == "thinking"
+    assert wait_until(lambda: bubble_text(friend) == "저도 반가워요!")
+    assert engine.asked == ["안녕, 반가워"]
+    assert [m.content for m in friend.memory.recent_messages(5)] == ["안녕, 반가워", "저도 반가워요!"]
+
+
+def test_answer_is_spoken_sentence_by_sentence(make_friend, wait_until):
+    friend = make_friend(FakeEngine(replies=["첫 문장이에요. 둘째 문장이에요."]))
+
+    friend.stage.submitted.emit("말해 봐")
+
+    assert wait_until(lambda: friend.speaker.said == ["첫 문장이에요.", "둘째 문장이에요."])
+
+
+def test_bubble_and_ears_wait_for_the_voice_to_finish(make_friend, wait_until, qapp):
+    friend = make_friend(FakeEngine(replies=["지금 말하는 중이에요."]))
+    friend.stage.submitted.emit("말해 봐")
+    assert wait_until(lambda: friend.speaker.said == ["지금 말하는 중이에요."])
+
+    friend.speaker.started.emit()
+    qapp.processEvents()
+    assert friend.listener.paused  # 자기 목소리를 듣지 않게 귀를 막는다
+    assert friend.stage.character.expression == "talking"
+    assert not friend.stage.bubble._timer.isActive()
+
+    friend.speaker.finished.emit()
+    qapp.processEvents()
+    assert not friend.listener.paused
+    assert friend.stage.bubble._timer.isActive()
+
+
+@pytest.mark.parametrize("settings", [Settings(tts_enabled=False), Settings(do_not_disturb=True)])
+def test_no_voice_when_turned_off_or_do_not_disturb(make_friend, wait_until, settings):
+    friend = make_friend(FakeEngine(replies=["조용히 답할게요."]), settings=settings)
+
+    friend.stage.submitted.emit("말해 봐")
+
+    assert wait_until(lambda: bubble_text(friend) == "조용히 답할게요." and friend.stage.bubble._timer.isActive())
+    assert friend.speaker.said == []
+
+
+def test_ai_can_set_an_alarm_and_it_rings_aloud(make_friend, wait_until, monkeypatch):
+    plan = {"actions": [{"tool": "add_alarm", "minutes_from_now": 10, "message": "빨래 꺼내기"}]}
+    friend = make_friend(FakeEngine(plans=[plan], replies=["."]))
+
+    friend.stage.submitted.emit("10분 뒤에 빨래 꺼내라고 해 줘")
+    assert wait_until(lambda: bubble_text(friend).endswith("'빨래 꺼내기' 알려 줄게요.") and not friend._replying)
+    assert [alarm.message for alarm in friend.repository.list_pending_alarms()] == ["빨래 꺼내기"]
+    assert friend.speaker.said == [bubble_text(friend)]
+
+    later = datetime.now() + timedelta(minutes=11)
+    monkeypatch.setattr(app_module, "datetime", type("Clock", (), {"now": staticmethod(lambda: later)}))
+    friend._check_alarms()
+
+    assert bubble_text(friend) == "빨래 꺼내기 시간이에요!"
+    assert friend.stage.character.expression == "surprised"
+    assert friend.speaker.said[-1] == "빨래 꺼내기 시간이에요!"
+
+
+def test_simple_commands_still_work_when_the_ai_is_down(make_friend, wait_until):
+    friend = make_friend(FakeEngine(fail_with=EngineError("Ollama에 연결할 수 없습니다.")))
+
+    friend.stage.submitted.emit("10분 뒤 빨래 꺼내기")
+
+    assert wait_until(lambda: "빨래 꺼내기" in bubble_text(friend))
+    assert [alarm.message for alarm in friend.repository.list_pending_alarms()] == ["빨래 꺼내기"]
+
+
+def test_ai_failure_is_explained_for_ordinary_talk(make_friend, wait_until):
+    friend = make_friend(FakeEngine(fail_with=EngineError("Ollama에 연결할 수 없습니다.")))
+
+    friend.stage.submitted.emit("오늘 뭐 했어?")
+
+    assert wait_until(lambda: "Ollama" in bubble_text(friend) and friend.stage.character.expression == "sad")
+
+
+def test_command_spoken_with_the_name_is_answered(make_friend, wait_until):
+    engine = FakeEngine(replies=["불은 제가 못 켜요."])
+    friend = make_friend(engine)
+
+    friend.listener.heard.emit("불 켜 줘", "wake")
+
+    assert wait_until(lambda: engine.asked == ["불 켜 줘"])
+    assert "불 켜 줘" in friend.stage.input_bar._edit.placeholderText()
+
+
+def test_bare_name_gets_a_short_acknowledgement_without_asking_the_ai(make_friend, qapp):
+    engine = FakeEngine()
+    friend = make_friend(engine)
+
+    friend.listener.heard.emit("", "wake_only")
+    qapp.processEvents()
+
+    assert bubble_text(friend) == app_module.WAKE_ACK
+    assert engine.asked == []
+    assert friend.speaker.said == []
+
+
+def test_mic_button_starts_listening_and_new_input_interrupts_speech(make_friend):
+    friend = make_friend()
+
+    friend.stage.mic_clicked.emit()
+    friend.stage.submitted.emit("잠깐만")
+
+    assert friend.listener.armed == 1
+    assert friend.speaker.stops >= 1
+
+
+def test_microphone_state_and_failure_reach_the_screen(make_friend, qapp):
+    friend = make_friend()
+
+    friend.listener.state_changed.emit("hearing")
+    assert friend.stage.input_bar.mic_state == "hearing"
+
+    friend.listener.failed.emit("마이크를 열 수 없습니다: 장치 없음")
+    qapp.processEvents()
+    assert "마이크" in bubble_text(friend)
+    assert load_settings(paths.settings_path()).wake_word_enabled is False
+
+
+def test_voice_and_wake_word_switches_are_applied_and_remembered(make_friend):
+    friend = make_friend()
+    assert friend.listener.wake_enabled is None  # 시작할 때는 설정값대로 만들어져 있다
+
+    friend.menu.tts_toggled.emit(False)
+    friend.menu.wake_toggled.emit(False)
+
+    saved = load_settings(paths.settings_path())
+    assert saved.tts_enabled is False and saved.wake_word_enabled is False
+    assert friend.listener.wake_enabled is False
+    assert friend.speaker.stops >= 1
+
+
+def set_clock(monkeypatch, moment: datetime) -> None:
+    monkeypatch.setattr(app_module, "datetime", type("Clock", (), {"now": staticmethod(lambda: moment)}))
+
+
+def test_offer_from_the_screen_is_spoken_but_only_occasionally(make_friend, monkeypatch):
+    start = datetime(2026, 10, 6, 15, 0)
+    set_clock(monkeypatch, start)
+    friend = make_friend()
+    assert friend.watcher.running
+
+    # 켠 직후에는 말을 걸지 않는다.
+    friend.watcher.noted.emit("코드를 고치는 중", "오류 같이 볼까요?")
+    assert "오류" not in bubble_text(friend)
+
+    set_clock(monkeypatch, start + timedelta(minutes=61))
+    friend.watcher.noted.emit("코드를 고치는 중", "오류 같이 볼까요?")
+    assert bubble_text(friend) == "오류 같이 볼까요?"
+    assert friend.speaker.said == ["오류 같이 볼까요?"]
+    # 이어서 "응"이라고 답해도 알아듣도록 대화 기록에 남긴다.
+    assert friend.memory.recent_messages(1)[0].content == "오류 같이 볼까요?"
+
+    set_clock(monkeypatch, start + timedelta(minutes=80))
+    friend.watcher.noted.emit("코드를 고치는 중", "또 도와줄까요?")
+    assert bubble_text(friend) == "오류 같이 볼까요?"
+
+
+@pytest.mark.parametrize("settings", [Settings(do_not_disturb=True), Settings(proactive_per_hour=0)])
+def test_no_offer_during_do_not_disturb_or_when_turned_off(make_friend, monkeypatch, settings):
+    set_clock(monkeypatch, datetime(2026, 10, 6, 15, 0))
+    friend = make_friend(settings=settings)
+
+    set_clock(monkeypatch, datetime(2026, 10, 6, 18, 0))
+    friend.watcher.noted.emit("영상을 보는 중", "자막 찾아 줄까요?")
+
+    assert "자막" not in bubble_text(friend)
+
+
+def test_screen_watching_can_be_seen_and_switched_off_at_any_time(make_friend):
+    friend = make_friend()
+
+    friend.watcher.state_changed.emit("watching")
+    assert friend.stage.input_bar.eye_state == "watching"
+
+    friend.stage.input_bar._eye.click()
+
+    assert friend.watcher.enabled is False
+    assert load_settings(paths.settings_path()).screen_watch_enabled is False
+
+    friend.menu.screen_toggled.emit(True)
+    assert friend.watcher.enabled is True
+
+
+def test_screen_watching_stays_off_when_it_was_turned_off_before(make_friend):
+    friend = make_friend(settings=Settings(screen_watch_enabled=False))
+
+    assert friend.watcher.enabled is False
+
+
+def test_request_to_operate_the_pc_starts_the_operator(make_friend, wait_until):
+    plan = {"actions": [{"tool": "control_pc", "goal": "메모장 열어서 안녕이라고 써 줘"}]}
+    friend = make_friend(FakeEngine(plans=[plan]))
+
+    friend.stage.submitted.emit("메모장 열어서 안녕이라고 써 줘")
+
+    assert wait_until(lambda: friend.agent.goals == ["메모장 열어서 안녕이라고 써 줘"])
+    assert wait_until(lambda: "Esc" in bubble_text(friend))
+
+
+def test_esc_stops_the_operator_only_while_it_is_working(make_friend, monkeypatch):
+    FakeHotkey.made.clear()
+    monkeypatch.setattr(app_module, "GlobalHotkey", FakeHotkey)
+    friend = make_friend()
+    assert all(hotkey.text != "Esc" for hotkey in FakeHotkey.made)  # 평소에는 Esc를 가로채지 않는다
+
+    friend.agent.started.emit("메모장 열기")
+    escape = FakeHotkey.made[-1]
+    assert (escape.text, escape.allow_bare) == ("Esc", True)
+
+    escape.pressed.emit()
+    assert friend.agent.stops == 1
+
+    friend.agent.finished.emit("멈췄어요.", False)
+    assert escape.released
+    assert bubble_text(friend) == "멈췄어요."
+    assert friend.memory.recent_messages(1)[0].content == "멈췄어요."
+
+
+def test_operator_is_not_allowed_to_work_without_a_stop_key(make_friend):
+    friend = make_friend()  # 이 테스트 환경에서는 단축키 등록이 전부 실패한다
+
+    friend.agent.started.emit("메모장 열기")
+
+    assert friend.agent.stops == 1
+    assert "Esc" in bubble_text(friend)
+
+
+@pytest.mark.parametrize(("button", "allowed"), [("Yes", True), ("No", False)])
+def test_risky_step_is_put_to_the_user_and_the_answer_passed_back(make_friend, button, allowed):
+    from PySide6.QtWidgets import QMessageBox
+
+    friend = make_friend()
+
+    friend.agent.confirm_needed.emit("파일을 지울게요. ('삭제'을(를) 누르는 일이에요)")
+
+    assert "파일을 지울게요." in friend._permission.text()
+    friend._permission.button(getattr(QMessageBox.StandardButton, button)).click()
+    assert friend.agent.answers == [allowed]
+
+
+def test_operator_narrates_what_it_is_doing(make_friend):
+    friend = make_friend()
+
+    friend.agent.step.emit("파일 메뉴를 누를게요.")
+
+    assert bubble_text(friend) == "파일 메뉴를 누를게요."
+
+
+def menu_item(friend, label: str):
+    return next(action for action, name, _level in friend.menu._lockable if name == label)
+
+
+def test_talking_raises_the_bond_and_a_new_level_unlocks_outfits_and_props(make_friend, wait_until):
+    engine = FakeEngine(replies=["네!"] * 10)
+    friend = make_friend(engine)
+    assert not menu_item(friend, "하늘 가디건").isEnabled()
+    assert "레벨 2에 열림" in menu_item(friend, "하늘 가디건").text()
+
+    for number in range(9):
+        friend.stage.submitted.emit(f"말 {number}")
+    assert wait_until(lambda: len(engine.asked) == 9 and not friend._replying)
+    assert "친밀도 레벨 1 · 다음 레벨까지 1마디" in friend.menu._bond.text()
+
+    friend.stage.submitted.emit("열 번째 말")
+
+    assert wait_until(lambda: "친밀도 레벨 2" in bubble_text(friend))
+    assert "하늘 가디건" in bubble_text(friend) and "리본" in bubble_text(friend)
+    assert menu_item(friend, "하늘 가디건").isEnabled() and menu_item(friend, "리본").isEnabled()
+    assert not menu_item(friend, "분홍 원피스").isEnabled()
+    assert friend.memory.get_state("bond_points", 0) == 10
+
+
+def test_bond_is_remembered_across_restarts(make_friend):
+    first = make_friend()
+    first.memory.set_state("bond_points", 35)
+    first.shutdown()
+
+    second = make_friend()
+
+    assert "친밀도 레벨 3" in second.menu._bond.text()
+    assert menu_item(second, "안경").isEnabled()
+
+
+def test_props_can_be_worn_and_are_remembered(make_friend):
+    friend = make_friend()
+    before = friend.stage.character.grab().toImage()
+
+    friend.menu.prop_toggled.emit("ribbon", True)
+
+    assert load_settings(paths.settings_path()).props == ("ribbon",)
+    assert friend.stage.character.grab().toImage() != before
+
+    friend.menu.prop_toggled.emit("ribbon", False)
+    assert load_settings(paths.settings_path()).props == ()
+
+
+def test_character_looks_sleepy_late_at_night(make_friend, monkeypatch):
+    set_clock(monkeypatch, datetime(2026, 10, 6, 3, 0))
+
+    friend = make_friend()
+
+    assert friend.stage.idle_expression == "sleepy"
+
+
+def test_ai_is_told_how_close_we_are_and_how_the_character_feels(make_friend, wait_until, monkeypatch):
+    set_clock(monkeypatch, datetime(2026, 10, 6, 3, 0))
+    seen = []
+
+    class Recording(FakeEngine):
+        def chat(self, messages, *, on_delta=None, should_stop=None):
+            seen.append(messages[0]["content"])
+            return super().chat(messages, on_delta=on_delta, should_stop=should_stop)
+
+    friend = make_friend(Recording())
+    friend.stage.submitted.emit("안녕")
+
+    assert wait_until(lambda: len(seen) == 1)
+    assert "친밀도 레벨 1" in seen[0] and "졸림" in seen[0]
+
+
+def test_settings_window_saves_character_and_app_settings_then_restarts(make_friend, monkeypatch, tmp_path):
+    restarts = []
+    monkeypatch.setattr(app_module, "restart", lambda: restarts.append(True))
+    friend = make_friend()
+
+    friend.menu.settings_requested.emit()
+    dialog = friend._settings_dialog
+    dialog.name.setText("하루")
+    dialog.interval.setValue(12)
+    dialog.blocked.setPlainText("stardew")
+    dialog.accept()
+
+    assert load_settings(paths.settings_path()).screen_interval_sec == 12
+    assert load_settings(paths.settings_path()).blocked_apps == ("stardew",)
+    assert load_pack(tmp_path / "characters" / "default").name == "하루"
+    assert restarts == [True]
+
+
+def test_voice_preview_speaks_with_the_chosen_voice_and_cancel_puts_the_old_one_back(make_friend):
+    friend = make_friend()
+    original = friend.speaker.voice = friend.pack.voice
+
+    friend.menu.settings_requested.emit()
+    friend._settings_dialog.voice.setCurrentText("ko-KR-InJoonNeural")
+    friend._settings_dialog.preview.click()
+
+    assert friend.speaker.voice.name == "ko-KR-InJoonNeural"
+    assert friend.speaker.said == ["안녕하세요, 모모예요."]
+
+    friend._settings_dialog.reject()
+    assert friend.speaker.voice == original
+
+
+def test_start_with_windows_follows_the_switch_in_settings(make_friend, monkeypatch, tmp_path):
+    monkeypatch.setattr(app_module, "restart", lambda: None)
+    startup = tmp_path / "Startup"
+    friend = make_friend()
+
+    friend.menu.settings_requested.emit()
+    assert not friend._settings_dialog.autostart.isChecked()
+    friend._settings_dialog.autostart.setChecked(True)
+    friend._settings_dialog.accept()
+
+    assert (startup / "assister.cmd").exists()
+
+
+def test_clicking_the_tray_icon_calls_the_character(make_friend, qapp):
+    from PySide6.QtWidgets import QSystemTrayIcon
+
+    friend = make_friend()
+    friend.stage.input_bar.hide()
+
+    friend.menu.tray.activated.emit(QSystemTrayIcon.ActivationReason.Trigger)
+
+    assert friend.stage.input_bar.isVisible()
+
+
+def test_switching_character_keeps_each_character_s_own_name_and_voice(make_friend, monkeypatch, tmp_path):
+    monkeypatch.setattr(app_module, "restart", lambda: None)
+    generate_placeholder_pack(tmp_path / "characters" / "haru", name="하루")
+    first = make_friend(settings=Settings(outfit="dress", props=("ribbon",)))
+
+    first.menu.settings_requested.emit()
+    first._settings_dialog.character.setCurrentText("haru")
+    first._settings_dialog.name.setText("이 이름은 저장되면 안 됨")
+    first._settings_dialog.accept()
+
+    saved = load_settings(paths.settings_path())
+    assert (saved.character, saved.outfit, saved.props) == ("haru", "basic", ())
+    assert load_pack(tmp_path / "characters" / "default").name == "모모"
+    assert make_friend().pack.name == "하루"
+
+
+def test_cancelled_settings_change_nothing(make_friend, monkeypatch):
+    restarts = []
+    monkeypatch.setattr(app_module, "restart", lambda: restarts.append(True))
+    friend = make_friend()
+
+    friend.menu.settings_requested.emit()
+    friend._settings_dialog.name.setText("하루")
+    friend._settings_dialog.reject()
+
+    assert friend.pack.name == "모모" and restarts == []
+    assert not paths.settings_path().exists()
+
+
+def test_memory_can_be_exported_to_a_file(make_friend, monkeypatch, tmp_path):
+    archive = tmp_path / "기억.zip"
+    monkeypatch.setattr(app_module, "pick_save_path", lambda: str(archive))
+    friend = make_friend()
+    friend.memory.add_fact("이름은 상민", datetime(2026, 10, 6, 15, 0))
+
+    friend.menu.export_requested.emit()
+
+    assert archive.exists()
+    assert "기억" in bubble_text(friend)
+
+
+def test_importing_memory_asks_first_then_replaces_and_restarts(make_friend, monkeypatch, tmp_path):
+    from assister.memory.backup import export_data
+
+    source = make_friend()
+    source.memory.set_state("bond_points", 77)
+    archive = tmp_path / "기억.zip"
+    export_data(paths.data_dir(), archive)
+    source.memory.set_state("bond_points", 1)
+
+    asked, restarts = [], []
+    monkeypatch.setattr(app_module, "pick_open_path", lambda: str(archive))
+    monkeypatch.setattr(app_module, "confirm", lambda text: asked.append(text) or True)
+    monkeypatch.setattr(app_module, "restart", lambda: restarts.append(True))
+
+    source.menu.import_requested.emit()
+
+    assert len(asked) == 1 and "사라" in asked[0]
+    assert restarts == [True]
+    assert make_friend().memory.get_state("bond_points", 0) == 77
+
+
+def test_import_is_dropped_when_refused_or_the_file_is_not_a_memory_file(make_friend, monkeypatch, tmp_path):
+    bad = tmp_path / "bad.zip"
+    bad.write_bytes(b"not a zip")
+    restarts = []
+    monkeypatch.setattr(app_module, "restart", lambda: restarts.append(True))
+    monkeypatch.setattr(app_module, "pick_open_path", lambda: str(bad))
+    monkeypatch.setattr(app_module, "confirm", lambda text: True)
+    friend = make_friend()
+
+    friend.menu.import_requested.emit()
+
+    assert restarts == [] and friend.stage.character.expression == "sad"
+    assert friend.memory.count_messages() == 0  # 앱은 꺼지지 않고 그대로 쓸 수 있다
+
+
+def test_face_matches_the_answer_once_it_is_said(make_friend, wait_until, qapp):
+    friend = make_friend(FakeEngine(replies=["정말 축하해요!"]), settings=Settings(tts_enabled=False))
+
+    friend.stage.submitted.emit("나 시험 붙었어")
+
+    assert wait_until(lambda: bubble_text(friend) == "정말 축하해요!" and not friend._replying)
+    assert friend.stage.character.expression == "excited"
+
+
+def test_face_matches_the_answer_after_the_voice_finishes(make_friend, wait_until, qapp):
+    friend = make_friend(FakeEngine(replies=["미안해요, 그건 못 해요."]))
+    friend.stage.submitted.emit("달에 데려다 줘")
+    assert wait_until(lambda: len(friend.speaker.said) == 1 and not friend._replying)
+
+    friend.speaker.started.emit()
+    qapp.processEvents()
+    assert friend.stage.character.expression == "talking"
+
+    friend.speaker.finished.emit()
+    qapp.processEvents()
+    assert friend.stage.character.expression == "sad"
+
+
+def test_talking_before_the_model_is_loaded_says_it_is_still_waking_up(make_friend, qapp):
+    """처음 켜면 모델을 올리는 데 1분 넘게 걸릴 수 있다. 말없이 '…'만 띄우지 않는다."""
+    import threading
+
+    gate = threading.Event()
+
+    class Slow(FakeEngine):
+        def warm_up(self):
+            gate.wait(3)
+
+    friend = make_friend(Slow(), wait_ready=False)
+    try:
+        friend.stage.submitted.emit("안녕")
+        qapp.processEvents()
+
+        assert "깨우는 중" in bubble_text(friend)
+    finally:
+        gate.set()
+
+
+def test_second_copy_of_the_app_is_refused_while_one_is_running(tmp_path):
+    first = app_module.single_instance_lock(tmp_path)
+    assert first is not None
+
+    assert app_module.single_instance_lock(tmp_path, wait_ms=50) is None
+
+    first.unlock()
+    again = app_module.single_instance_lock(tmp_path, wait_ms=50)
+    assert again is not None
+    again.unlock()
+
+
+def test_moving_and_do_not_disturb_are_remembered(make_friend):
+    friend = make_friend()
+
+    friend.stage.position_changed.emit(QPoint(111, 222))
+    friend.menu.do_not_disturb_toggled.emit(True)
+
+    saved = load_settings(paths.settings_path())
+    assert saved.position == (111, 222)
+    assert saved.do_not_disturb is True
