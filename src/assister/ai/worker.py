@@ -26,6 +26,7 @@ class ChatWorker(QObject):
     tool_used = Signal(str)  # 부른 도구 이름
     finished = Signal(str)  # 다 된 답
     failed = Signal(str)  # 사용자에게 보여 줄 오류 설명
+    confirm_needed = Signal(str)  # 해도 되는지 사용자에게 물어볼 일
 
     def __init__(self, session: ChatSession) -> None:
         super().__init__()
@@ -33,6 +34,8 @@ class ChatWorker(QObject):
         self._requests: queue.Queue[object] = queue.Queue()
         self._cancelled = False
         self._stopping = False
+        self._answered = threading.Event()
+        self._allowed = False
         self._thread = threading.Thread(target=self._run, name="chat-worker", daemon=True)
         self._thread.start()
 
@@ -62,8 +65,23 @@ class ChatWorker(QObject):
         """지금 만들고 있는 답을 중간에 멈춘다."""
         self._cancelled = True
 
+    def confirm(self, text: str) -> bool:
+        """사용자에게 허락을 구하고 답이 올 때까지 기다린다. 답을 만드는 스레드에서 부른다."""
+        self._answered.clear()
+        self._allowed = False
+        if self._stopping:
+            return False
+        self.confirm_needed.emit(text)
+        self._answered.wait()
+        return self._allowed and not self._stopping
+
+    def answer(self, allowed: bool) -> None:
+        self._allowed = allowed
+        self._answered.set()
+
     def shutdown(self) -> None:
         self._stopping = True
+        self._answered.set()  # 허락을 기다리던 중이면 거절로 끝낸다
         self._requests.put(None)
         self._thread.join(JOIN_TIMEOUT_SEC)
 

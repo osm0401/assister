@@ -12,6 +12,7 @@ from assister.character.pack import load_pack
 from assister.character.stage import THINKING_TEXT, CharacterStage
 from assister.config import Settings, load_settings, save_settings
 from assister.system.hotkey import HotkeyError
+from assister.system.shell import CommandResult
 
 # ---------- 캐릭터 창, 말풍선, 입력창 ----------
 
@@ -296,6 +297,9 @@ def make_friend(qapp, tmp_path, monkeypatch, wait_until):
     monkeypatch.setattr(app_module, "GlobalHotkey", refuse_hotkey)
     # 진짜 시작프로그램 폴더를 건드리지 않는다.
     monkeypatch.setattr(app_module.autostart, "startup_folder", lambda: tmp_path / "Startup")
+    # 진짜 명령을 실행하거나 인터넷을 검색하지 않는다.
+    monkeypatch.setattr(app_module.shell, "run", lambda command: CommandResult("", 0))
+    monkeypatch.setattr(app_module, "search", lambda query: [])
     friends = []
 
     def make(engine=None, *, settings: Settings | None = None, wait_ready: bool = True):
@@ -605,6 +609,45 @@ def test_risky_step_is_put_to_the_user_and_the_answer_passed_back(make_friend, b
     assert "파일을 지울게요." in friend._permission.text()
     friend._permission.button(getattr(QMessageBox.StandardButton, button)).click()
     assert friend.agent.answers == [allowed]
+
+
+def asking_to_delete(make_friend, monkeypatch, wait_until):
+    """'old.txt 지워 줘'라고 해서 허락을 구하는 데까지 간다."""
+    ran = []
+    monkeypatch.setattr(app_module.shell, "run", lambda command: ran.append(command) or CommandResult("보냄", 0))
+    plan = {"actions": [{"tool": "run_command", "command": "Remove-Item old.txt"}]}
+    engine = FakeEngine(plans=[plan], replies=["지웠어요."])
+    friend = make_friend(engine)
+    friend.stage.submitted.emit("old.txt 지워 줘")
+    assert wait_until(lambda: friend._permission is not None)
+    return friend, engine, ran
+
+
+def test_risky_command_waits_until_the_user_says_yes(make_friend, monkeypatch, wait_until):
+    friend, engine, ran = asking_to_delete(make_friend, monkeypatch, wait_until)
+
+    assert "Remove-Item old.txt" in friend._permission.text() and ran == []
+    assert "휴지통" in friend.speaker.said[-1] and "Remove-Item" not in friend.speaker.said[-1]  # 까닭만 읽어 준다
+    assert friend.listener.armed == 1  # PC를 만지지 않고 말로 답할 수 있게 귀를 연다
+
+    friend.listener.heard.emit("음 글쎄", "command")  # 알아듣지 못한 말은 대답이 아니다
+
+    assert friend._permission is not None and friend.listener.armed == 2 and ran == []
+
+    friend.listener.heard.emit("허락", "command")
+
+    assert wait_until(lambda: ran == ["Remove-Item old.txt"])
+    assert friend._permission is None
+    assert wait_until(lambda: engine.asked == ["old.txt 지워 줘"])  # 허락을 구하던 중에 한 말은 AI에게 넘기지 않는다
+
+
+def test_risky_command_is_dropped_when_the_user_says_no(make_friend, monkeypatch, wait_until):
+    friend, engine, ran = asking_to_delete(make_friend, monkeypatch, wait_until)
+
+    friend.listener.heard.emit("아니 하지 마", "command")
+
+    assert wait_until(lambda: "실행하지 않을게요" in bubble_text(friend))
+    assert ran == [] and engine.asked == []
 
 
 def test_operator_narrates_what_it_is_doing(make_friend):

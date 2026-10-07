@@ -1,7 +1,7 @@
 """실제 모델이 사용자의 말을 맞는 작업으로 바꾸는지 잰다.
 
 지시문(ai/prompt.py)이나 작업 틀(ai/tools.py)을 고친 뒤에 돌려서, 전보다 나빠지지 않았는지 본다.
-Ollama가 켜져 있어야 한다. 기억과 할 일은 임시 폴더에만 쓴다.
+Ollama가 꺼져 있으면 켠다. 기억과 할 일은 임시 폴더에만 쓰고, 인터넷 검색과 명령 실행은 실제로 하지 않는다.
 
     uv run python bench/planner_check.py
 """
@@ -15,9 +15,11 @@ from datetime import datetime
 from pathlib import Path
 
 from assister.ai.chat import ChatSession
-from assister.ai.engine import OllamaEngine
+from assister.ai.engine import OllamaEngine, start_ollama
+from assister.ai.search import Hit
 from assister.ai.tools import ToolBox
 from assister.memory.store import MemoryStore
+from assister.system.shell import CommandResult, risk_reason
 from assister.tasks.repository import TaskRepository
 
 NOW = datetime(2026, 10, 6, 15, 0)  # 화요일 오후 3시
@@ -52,7 +54,16 @@ CASES: list[tuple[str, set[str], tuple[str, str] | None]] = [
     ("메모장 열어서 안녕이라고 써 줘", {"control_pc"}, None),
     ("크롬에서 네이버 열어줘", {"control_pc"}, None),
     ("계산기 좀 켜줘", {"control_pc"}, None),
+    ("오늘 서울 날씨 어때?", {"web_search"}, None),
+    ("요즘 달러 환율 얼마야?", {"web_search"}, None),
+    ("오늘 뉴스 뭐 있는지 검색해 줘", {"web_search"}, None),
+    ("바탕화면에 메모.txt 파일 만들어 줘", {"run_command"}, None),
+    ("다운로드 폴더에 뭐 있어?", {"run_command"}, None),
+    ("C 드라이브 용량 얼마나 남았어?", {"run_command"}, None),
+    ("바탕화면에 있는 old.txt 지워 줘", {"run_command"}, None),
 ]
+FOUND = [Hit("검색 결과", "https://example.com/", "서울은 맑고 낮 최고 21도, 달러 환율은 1,380원")]
+COMMANDS: list[str] = []  # AI가 만든 명령. 실제로 실행하지는 않고 끝에 보여 준다
 
 
 def check(engine: OllamaEngine, text: str, expected: set[str], alarm: tuple[str, str] | None) -> tuple[bool, str]:
@@ -63,7 +74,14 @@ def check(engine: OllamaEngine, text: str, expected: set[str], alarm: tuple[str,
         tasks.add_todo("보고서 쓰기", NOW)
         existing = tasks.add_alarm("약 먹기", NOW.replace(hour=21))
         memory.add_fact("떡볶이를 좋아함", NOW)
-        toolbox = ToolBox(tasks, memory, start_control=lambda goal: True)
+        toolbox = ToolBox(
+            tasks,
+            memory,
+            start_control=lambda goal: True,
+            search=lambda query: FOUND,  # 실제 검색은 안 함
+            shell=lambda command: COMMANDS.append(command) or CommandResult("메모.txt", 0),
+            confirm=lambda text: True,
+        )
         used: list[str] = []
         session = ChatSession(engine, memory, toolbox, character_name="모모", clock=lambda: NOW)
         reply = session.reply(text, on_tool=used.append)
@@ -77,7 +95,7 @@ def check(engine: OllamaEngine, text: str, expected: set[str], alarm: tuple[str,
 
 def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
-    engine = OllamaEngine(MODEL)
+    engine = OllamaEngine(MODEL, start_server=start_ollama)
     engine.warm_up()
     started = time.perf_counter()
     misses = 0
@@ -86,6 +104,8 @@ def main() -> int:
         misses += not ok
         if not ok:
             print(f"X {text}\n    기대: 작업={sorted(expected)} 알람={alarm}\n    실제: {detail}")
+    for command in COMMANDS:
+        print(f"명령: {command}  ->  {risk_reason(command) or '바로 실행'}")
     seconds = (time.perf_counter() - started) / len(CASES)
     print(f"맞음 {len(CASES) - misses}/{len(CASES)}, 한 마디에 평균 {seconds:.1f}초")
     return 1 if misses else 0

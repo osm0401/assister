@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import fields, replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -13,6 +14,7 @@ from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 from assister import paths
 from assister.ai.chat import ChatSession
 from assister.ai.engine import ChatEngine, OllamaEngine, start_ollama
+from assister.ai.search import search
 from assister.ai.tools import ToolBox
 from assister.ai.worker import ChatWorker
 from assister.character.art import generate_placeholder_pack
@@ -36,7 +38,7 @@ from assister.memory.store import MemoryStore
 from assister.screen.capture import take_snapshot
 from assister.screen.privacy import DEFAULT_SENSITIVE
 from assister.screen.watcher import ScreenWatcher
-from assister.system import autostart
+from assister.system import autostart, shell
 from assister.system.hotkey import GlobalHotkey, HotkeyError
 from assister.system.settings_dialog import SettingsDialog
 from assister.system.tray import AppMenu
@@ -46,7 +48,7 @@ from assister.voice.listener import MicListener
 from assister.voice.sentences import SentenceSplitter, speakable
 from assister.voice.stt import Transcriber
 from assister.voice.tts import Speaker
-from assister.voice.wake import VoiceRouter
+from assister.voice.wake import VoiceRouter, spoken_answer
 
 log = logging.getLogger(__name__)
 
@@ -140,7 +142,14 @@ class DesktopFriend(QObject):
             self._engine,
             self.memory,
             # 대화 작업 스레드에서 불린다. agent는 아래에서 만들지만 불릴 때는 이미 있다.
-            ToolBox(self.repository, self.memory, start_control=lambda goal: self.agent.run(goal)),
+            ToolBox(
+                self.repository,
+                self.memory,
+                start_control=lambda goal: self.agent.run(goal),
+                search=search,
+                shell=shell.run,
+                confirm=lambda text: self.chat.confirm(text),
+            ),
             character_name=self.pack.name,
             persona=self.pack.persona,
             extra_context=lambda: tone_note(level=level_for(self._points), mood=self._mood()),
@@ -174,6 +183,7 @@ class DesktopFriend(QObject):
         )
         self._stop_hotkey: GlobalHotkey | None = None
         self._permission: QMessageBox | None = None
+        self._permission_answer: Callable[[bool], None] | None = None
         if not settings.screen_watch_enabled:
             self.watcher.set_enabled(False)
         self._last_offer = datetime.now()
@@ -242,6 +252,7 @@ class DesktopFriend(QObject):
         self.chat.delta.connect(self._on_answer_delta)
         self.chat.finished.connect(self._on_answer_finished)
         self.chat.failed.connect(self._on_answer_failed)
+        self.chat.confirm_needed.connect(lambda text: self._ask_permission(text, self.chat.answer))
 
         self.speaker.started.connect(self._on_voice_started)
         self.speaker.finished.connect(self._on_voice_finished)
@@ -252,7 +263,7 @@ class DesktopFriend(QObject):
 
         self.agent.started.connect(self._on_control_started)
         self.agent.step.connect(lambda text: self.stage.say(text, "thinking"))
-        self.agent.confirm_needed.connect(self._on_confirm_needed)
+        self.agent.confirm_needed.connect(lambda text: self._ask_permission(text, self.agent.answer))
         self.agent.finished.connect(self._on_control_finished)
 
         self.watcher.noted.connect(self._on_screen_noted)
@@ -430,6 +441,8 @@ class DesktopFriend(QObject):
     def _on_voice_finished(self) -> None:
         self._voice_busy = False
         self.listener.resume()
+        if self._permission is not None:
+            self.listener.arm()  # 물음을 다 읽었으니 이제 대답을 듣는다
         if not self._replying:
             self._settle_face()
             self.stage.release()
@@ -454,6 +467,9 @@ class DesktopFriend(QObject):
     def _on_heard(self, text: str, via: str) -> None:
         if via == "wake_only":
             self.stage.say(WAKE_ACK, "smile")
+            return
+        if self._permission is not None:
+            self._hear_permission(text)
             return
         self.stage.input_bar.show_heard(text)
         self._on_submitted(text)
@@ -543,25 +559,41 @@ class DesktopFriend(QObject):
             self._stop_hotkey.release()
             self._stop_hotkey = None
 
-    def _on_confirm_needed(self, text: str) -> None:
-        """위험한 동작은 무엇을 할지 한 문장으로 보여 주고 허락을 받는다."""
+    def _ask_permission(self, text: str, answer: Callable[[bool], None]) -> None:
+        """위험한 일은 무엇을 할지 보여 주고 허락을 받는다. 버튼을 누르거나 '허락', '안 돼'라고 말해서 답한다."""
         yes, no = QMessageBox.StandardButton.Yes, QMessageBox.StandardButton.No
         box = QMessageBox(QMessageBox.Icon.Question, self.pack.name, f"이 작업을 할까요?\n\n{text}", yes | no)
         box.button(yes).setText("허락")
         box.button(no).setText("안 함")
         box.setDefaultButton(no)
         box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
-        box.finished.connect(lambda result: self.agent.answer(result == yes))
-        self._permission = box
-        self.stage.say(text, "thinking")
+        box.finished.connect(lambda result: self._on_permission_answered(box, result == yes, answer))
+        # ponytail: 한 번에 하나만 묻는다. PC 조작과 명령 실행이 동시에 물으면 앞의 창은 버튼으로만 답할 수 있다.
+        self._permission, self._permission_answer = box, answer
+        # 명령은 소리로 읽어 봐야 알아듣기 어려우니 첫 줄(까닭)만 말한다.
+        ask = f"{text.splitlines()[0]} 해도 될까요? '허락'이나 '안 돼'라고 말해 주세요."
+        self._say(Reply(ask, "thinking"), aloud=True)
+        self.listener.arm()
         box.open()
+
+    def _on_permission_answered(self, box: QMessageBox, allowed: bool, answer: Callable[[bool], None]) -> None:
+        if self._permission is box:
+            self._permission = None
+        answer(allowed)
+
+    def _hear_permission(self, text: str) -> None:
+        """허락을 기다리는 동안 들은 말은 대답으로만 듣는다. AI에게 넘기지 않는다."""
+        said = spoken_answer(text)
+        if said is None:
+            self.listener.arm()  # 못 알아들었으면 한 번 더 듣는다
+            return
+        self._permission.button(QMessageBox.StandardButton.Yes if said else QMessageBox.StandardButton.No).click()
 
     def _on_control_finished(self, message: str, ok: bool) -> None:
         self._release_stop_key()
-        if self._permission is not None:
-            # Esc로 멈췄을 때 떠 있던 확인 창을 닫는다.
+        if self._permission is not None and self._permission_answer == self.agent.answer:
+            # Esc로 멈췄을 때 떠 있던 확인 창을 닫는다. 닫히면서 거절로 답한다.
             self._permission.close()
-            self._permission = None
         self.memory.add_message("assistant", message, datetime.now())
         self._say(Reply(message, "excited" if ok else "sad"), aloud=True)
 

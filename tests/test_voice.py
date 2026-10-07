@@ -10,7 +10,7 @@ from assister.voice.listener import MicListener
 from assister.voice.sentences import SentenceSplitter, speakable
 from assister.voice.stt import usable_text
 from assister.voice.tts import Speaker, TtsError, Voice, decode_mp3
-from assister.voice.wake import Heard, VoiceRouter, WakeMatch, find_wake
+from assister.voice.wake import Heard, VoiceRouter, WakeMatch, find_wake, spoken_answer
 
 # ---------- 문장 나누기 ----------
 
@@ -156,6 +156,24 @@ def test_talking_about_the_name_is_not_a_call(text):
 
 def test_other_spellings_can_be_registered():
     assert find_wake("뭐뭐야 불 켜 줘", ["모모", "뭐뭐"]) == WakeMatch("불 켜 줘")
+
+
+@pytest.mark.parametrize(
+    ("said", "answer"),
+    [
+        ("허락", True),
+        ("응 해 줘", True),
+        ("실행해", True),
+        ("안 돼", False),
+        ("아니 하지 마", False),
+        ("실행하지 마", False),  # 거절하는 말이 섞였으면 거절이다
+        ("취소", False),
+        ("네", None),  # 조용한 소리를 '네'로 잘못 받아쓰는 일이 있어서 한 마디 답은 받지 않는다
+        ("음 글쎄", None),
+    ],
+)
+def test_spoken_answer_to_a_permission_question(said, answer):
+    assert spoken_answer(said) is answer
 
 
 def test_router_ignores_talk_that_is_not_addressed_to_the_character():

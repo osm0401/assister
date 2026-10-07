@@ -23,6 +23,20 @@ class Heard:
     via: str  # "wake": 이름과 함께 한 말, "wake_only": 이름만 부름, "command": 듣기를 켠 뒤 한 말
 
 
+SAYS_NO = re.compile(r"아니|안\s?돼|안\s?해|하지\s?마|취소|그만|싫어|멈춰")
+SAYS_YES = re.compile(r"허락|실행|진행|해\s?줘|해\s?도\s?돼|그렇게\s?해|좋아")
+
+
+def spoken_answer(text: str) -> bool | None:
+    """허락을 구하는 물음에 한 말이 허락인지 거절인지. 어느 쪽인지 모르겠으면 None.
+
+    '네', '응' 같은 한 마디는 받지 않는다. 받아쓰기가 조용한 소리를 그렇게 잘못 듣는 일이 있어서다.
+    """
+    if SAYS_NO.search(text):
+        return False
+    return True if SAYS_YES.search(text) else None
+
+
 def _pattern(name: str) -> re.Pattern[str]:
     # 받아쓰기가 '모 모야'처럼 띄어 쓰기도 해서 글자 사이 빈칸을 허용한다.
     spaced = r"\s*".join(re.escape(char) for char in name if not char.isspace())

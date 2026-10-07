@@ -7,8 +7,10 @@ import pytest
 from assister.ai.chat import FALLBACK_REPLY, MAX_ACTIONS, ChatSession
 from assister.ai.engine import EngineError, OllamaEngine
 from assister.ai.prompt import build_planner_prompt, build_system_prompt, format_now
+from assister.ai.search import Hit, SearchError
 from assister.ai.tools import ACTION_FORMAT, Outcome, ToolBox
 from assister.memory.store import MemoryStore
+from assister.system.shell import CommandResult
 from assister.tasks.repository import TaskRepository
 
 NOW = datetime(2026, 10, 6, 15, 0, 0)  # 화요일
@@ -423,6 +425,90 @@ def test_control_pc_tool_says_so_when_busy_or_unavailable(stores):
     assert not ToolBox(*stores).execute("control_pc", {"goal": "계산기 열어 줘"}, NOW).ok
 
 
+def test_web_search_tool_hands_results_to_the_ai_quietly(stores):
+    asked = []
+
+    def search(query):
+        asked.append(query)
+        return [Hit("기상청 날씨누리", "https://www.weather.go.kr/w/index.do", "서울 오늘 맑음, 낮 최고 21도")]
+
+    outcome = ToolBox(*stores, search=search).execute("web_search", {"query": " 서울 오늘 날씨 "}, NOW)
+
+    assert asked == ["서울 오늘 날씨"]
+    # 검색 결과는 사용자에게 그대로 띄우지 않고, AI가 읽고 답하게 한다.
+    assert outcome.ok and not outcome.shown
+    assert "낮 최고 21도" in outcome.text and "www.weather.go.kr" in outcome.text
+    assert "/w/index.do" not in outcome.text  # 긴 주소는 목소리로 읽기 나쁘니 사이트 이름만 적는다
+
+
+def test_web_search_tool_says_so_when_it_cannot_search(stores):
+    def refused(query):
+        raise SearchError("검색 서비스가 지금은 검색을 받아 주지 않습니다")
+
+    outcome = ToolBox(*stores, search=refused).execute("web_search", {"query": "날씨"}, NOW)
+
+    assert not outcome.ok and "받아 주지" in outcome.text
+    assert "결과가 없" in ToolBox(*stores, search=lambda query: []).execute("web_search", {"query": "날씨"}, NOW).text
+    assert not ToolBox(*stores).execute("web_search", {"query": "날씨"}, NOW).ok
+
+
+LISTING = CommandResult("메모.txt", 0)
+
+
+def shell_toolbox(stores, *, answers=(), result=LISTING):
+    ran, asked = [], []
+    replies = iter(answers)
+    toolbox = ToolBox(
+        *stores,
+        shell=lambda command: ran.append(command) or result,
+        confirm=lambda text: asked.append(text) or next(replies),
+    )
+    return toolbox, ran, asked
+
+
+def test_run_command_tool_runs_harmless_commands_without_asking(stores):
+    toolbox, ran, asked = shell_toolbox(stores)
+
+    outcome = toolbox.execute("run_command", {"command": "Get-ChildItem $Desktop"}, NOW)
+
+    assert ran == ["Get-ChildItem $Desktop"] and asked == []
+    # 출력은 사용자에게 그대로 띄우지 않고, AI가 읽고 답하게 한다.
+    assert outcome.ok and not outcome.shown and "메모.txt" in outcome.text
+
+
+def test_run_command_tool_asks_before_a_risky_looking_command(stores):
+    toolbox, ran, asked = shell_toolbox(stores, answers=[False, True])
+
+    refused = toolbox.execute("run_command", {"command": "Remove-Item a.txt"}, NOW)
+
+    assert ran == [] and refused.shown and "실행하지 않" in refused.text
+    assert "휴지통" in asked[0] and "Remove-Item a.txt" in asked[0]  # 까닭과 명령을 그대로 보여 준다
+
+    toolbox.execute("run_command", {"command": "Remove-Item a.txt"}, NOW)
+
+    assert ran == ["Remove-Item a.txt"]
+
+
+def test_run_command_tool_never_runs_a_risky_command_it_cannot_ask_about(stores):
+    ran = []
+    toolbox = ToolBox(*stores, shell=lambda command: ran.append(command) or CommandResult("", 0))
+
+    toolbox.execute("run_command", {"command": "Remove-Item a.txt"}, NOW)
+
+    assert ran == []
+
+
+def test_run_command_tool_reports_failures(stores):
+    failed, _, _ = shell_toolbox(stores, result=CommandResult("오류: 경로를 찾을 수 없습니다.", 1))
+    cut_off, _, _ = shell_toolbox(stores, result=CommandResult("", None))
+
+    outcome = failed.execute("run_command", {"command": "Get-ChildItem C:\\none"}, NOW)
+
+    assert not outcome.ok and "경로를 찾을 수 없습니다" in outcome.text
+    assert not cut_off.execute("run_command", {"command": "Get-ChildItem"}, NOW).ok
+    assert not ToolBox(*stores).execute("run_command", {"command": "Get-ChildItem"}, NOW).ok
+
+
 def test_state_summary_numbers_todos_and_alarms_for_the_planner(toolbox):
     assert toolbox.state_summary(NOW) == "[지금 남은 할 일]\n없음\n\n[지금 울릴 알람]\n없음"
 
@@ -508,6 +594,16 @@ def test_reply_is_returned_streamed_and_remembered(stores):
     sent = engine.chat_calls[0]
     assert sent[0]["role"] == "system" and "모모" in sent[0]["content"]
     assert sent[-1] == {"role": "user", "content": "안녕"}
+
+
+def test_search_results_reach_the_answering_ai(stores):
+    tasks, memory = stores
+    engine = FakeEngine(plans=[plan({"tool": "web_search", "query": "서울 날씨"})], replies=["오늘 서울은 맑대요."])
+    toolbox = ToolBox(tasks, memory, search=lambda query: [Hit("기상청", "https://www.weather.go.kr/", "서울 맑음")])
+    session = ChatSession(engine, memory, toolbox, character_name="모모", clock=lambda: NOW)
+
+    assert session.reply("오늘 서울 날씨 어때?") == "오늘 서울은 맑대요."
+    assert "서울 맑음" in engine.chat_calls[0][0]["content"]
 
 
 def test_earlier_turns_are_sent_as_history(stores):
