@@ -14,7 +14,8 @@ from assister.control.actions import (
     risk_reason,
     to_screen,
 )
-from assister.control.agent import ControlAgent
+from assister.control.agent import REFUSED, STUCK, ControlAgent
+from assister.control.elements import Element, Listing
 from assister.control.executor import normalized, virtual_key
 from assister.screen.capture import Snapshot
 from assister.screen.privacy import Window
@@ -59,7 +60,7 @@ def test_unusable_actions_are_rejected(raw):
 
 def test_opening_a_program_brings_its_new_window_forward(monkeypatch):
     # 이 앱이 맨 앞이 아닐 때 연 프로그램은 뒤에 떠서, 이어지는 글자 입력이 쓰던 창으로 들어갔다.
-    looks = iter([[1, 2], [1, 2], [7, 1, 2]])
+    looks = iter([{1: "메모장", 2: "탐색기"}, {1: "메모장", 2: "탐색기"}, {7: "계산기", 1: "메모장", 2: "탐색기"}])
     done = []
     monkeypatch.setattr(executor, "_titled_windows", lambda: next(looks))
     monkeypatch.setattr(executor.os, "startfile", done.append)
@@ -69,6 +70,27 @@ def test_opening_a_program_brings_its_new_window_forward(monkeypatch):
     executor.Win32Executor().perform(Action("open", "x", text="calc"), None)
 
     assert done == ["calc", 7]
+
+
+def test_opening_a_page_in_a_browser_that_is_already_up_brings_that_window_forward(monkeypatch):
+    # 이미 떠 있는 브라우저는 새 창 없이 탭만 연다. 제목이 바뀐 브라우저 창이 그 창이다.
+    chrome, note = "새 탭 - Chrome\nChrome_WidgetWin_1", "제목 없음\nNotepad"
+    looks = iter([{1: chrome, 2: note}, {1: chrome, 2: "고친 글\nNotepad"}, {1: "다나와 - Chrome\nChrome_WidgetWin_1", 2: note}])
+    done = []
+    monkeypatch.setattr(executor, "_titled_windows", lambda: next(looks))
+    monkeypatch.setattr(executor.os, "startfile", done.append)
+    monkeypatch.setattr(executor, "_bring_forward", done.append)
+    monkeypatch.setattr(executor.time, "sleep", lambda _seconds: None)
+
+    executor.Win32Executor().perform(Action("open", "x", text="https://www.danawa.com"), None)
+
+    assert done == ["https://www.danawa.com", 1]  # 제목이 바뀐 메모장(2)은 브라우저가 아니라서 건드리지 않는다
+
+
+def test_open_uses_the_name_windows_knows_the_program_by():
+    # 'word'로는 열리지 않는다. 실제로 그렇게 하다 실패했다.
+    assert parse_action({"action": "open", "why": "x", "text": " Word "}).text == "winword"
+    assert parse_action({"action": "open", "why": "x", "text": "notepad"}).text == "notepad"
 
 
 def test_open_takes_the_program_name_from_target_when_text_is_empty():
@@ -293,6 +315,23 @@ def run_agent(qapp, wait_until):
         agent.join()
 
 
+def test_agent_gives_up_early_when_it_keeps_doing_the_same_thing(run_agent, wait_until):
+    # 실제로 같은 것을 12번 누르다 끝난 적이 있다.
+    again = {**CLICK, "x": 25, "why": "파일 메뉴를 다시 누를게요."}  # 말과 좌표가 조금 달라도 같은 것을 누르는 일이다
+    _, executor, seen = run_agent(FakeEngine(CLICK, again, CLICK, again, CLICK, DONE), max_steps=10)
+
+    assert wait_until(lambda: seen["finished"] == [(STUCK, False)])
+    assert len(executor.done) == 3
+
+
+def test_scrolling_again_and_again_is_not_being_stuck(run_agent, wait_until):
+    scroll = {"action": "scroll", "why": "더 내려 볼게요.", "monitor": 0, "x": 500, "y": 500, "amount": -3}
+    _, executor, seen = run_agent(FakeEngine(*[scroll] * 5, DONE), max_steps=10)
+
+    assert wait_until(lambda: seen["finished"] == [("다 썼어요.", True)])
+    assert len(executor.done) == 5
+
+
 def test_agent_looks_decides_and_acts_until_done(run_agent, wait_until):
     engine = FakeEngine(CLICK, TYPE, DONE)
 
@@ -502,3 +541,122 @@ def test_only_one_task_runs_at_a_time(run_agent, wait_until):
 
     release.set()
     assert wait_until(lambda: len(seen["finished"]) == 1)
+
+
+# ---------- 목록에서 번호로 고르기 ----------
+
+
+class Chooser:
+    """목록을 읽고 번호를 고르는 AI 흉내. 그림은 받지 않는다."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.prompts: list[str] = []
+
+    def complete_json(self, messages, schema):
+        assert "images" not in messages[-1]  # 화면 그림은 내보내지 않는다
+        self.prompts.append(messages[-1]["content"])
+        return self.answers.pop(0)
+
+
+def page(*named, texts=()):
+    """(종류, 이름) 몇 개가 한 줄씩 놓인 화면의 목록."""
+    items = tuple(Element(kind, name, (100, 100 + row * 50, 300, 140 + row * 50)) for row, (kind, name) in enumerate(named))
+    return Listing("다나와 - Chrome", (0, 0, 1000, 800), items, tuple(texts))
+
+
+SHOP = page(("입력 칸", "검색어 입력"), ("버튼", "검색"), ("링크", "메모리"), ("링크", "조립PC"))
+RESULTS = page(("링크", "삼성 DDR4 4GB"), ("링크", "가격순"), ("버튼", "관심"), ("버튼", "삭제"), texts=("12,000원",))
+
+
+def choose(**fields) -> dict:
+    return {"why": "그렇게 할게요.", "number": 0, "text": "", "submit": False, "keys": "", "amount": 0, "risky": False, **fields}
+
+
+@pytest.fixture
+def run_chooser(qapp):
+    agents = []
+
+    def run(chooser, listings, *, engine=None, confirm=None, max_steps=6):
+        executor, pages = FakeExecutor(), list(listings)
+        agent = ControlAgent(
+            engine or FakeEngine(),
+            executor,
+            take_snapshot=lambda keywords, width: screen(),
+            keywords=lambda: (),
+            width=1920,
+            max_steps=max_steps,
+            settle_sec=0,
+            chooser=chooser,
+            list_elements=lambda goal: pages.pop(0) if len(pages) > 1 else pages[0],
+        )
+        seen = {"asked": [], "finished": []}
+        agent.finished.connect(lambda message, ok: seen["finished"].append((message, ok)))
+        agent.confirm_needed.connect(lambda text: (seen["asked"].append(text), confirm is not None and agent.answer(confirm)))
+        agents.append(agent)
+        assert agent.run("다나와에서 DDR4 4GB 가장 싼 것 찾아 줘")
+        return agent, executor, seen
+
+    yield run
+    for agent in agents:
+        agent.stop()
+        agent.join()
+
+
+def test_agent_picks_from_the_list_and_reports_what_it_read(run_chooser, wait_until):
+    found = "가장 싼 것은 삼성 DDR4 4GB, 12,000원이에요."
+    chooser = Chooser(choose(action="type", number=1, text="DDR4 4GB", submit=True), choose(action="done", why=found))
+    engine = FakeEngine()  # 그림을 보는 AI는 한 번도 부르지 않는다
+
+    _, executor, seen = run_chooser(chooser, [SHOP, RESULTS], engine=engine)
+
+    assert wait_until(lambda: seen["finished"] == [(found, True)])
+    assert [(action.kind, action.keys or action.text or action.target) for action in executor.done] == [
+        ("click", "검색어 입력"),
+        ("key", "ctrl+a"),
+        ("type", "DDR4 4GB"),
+        ("key", "enter"),
+    ]
+    assert executor.points[0] == (200, 120)  # Windows가 알려 준 자리의 한가운데
+    assert "1 [입력 칸] 검색어 입력" in chooser.prompts[0] and "[화면에 보이는 글]\n12,000원" in chooser.prompts[1]
+    assert "1. '검색어 입력'에 'DDR4 4GB'을(를) 넣었다 그리고 Enter를 눌렀다" in chooser.prompts[1]
+    assert engine.prompts == []
+
+
+def test_a_number_that_is_not_on_the_list_is_never_pressed(run_chooser, wait_until):
+    chooser = Chooser(choose(action="press", number=40), choose(action="fail", why="못 찾겠어요."))
+
+    _, executor, seen = run_chooser(chooser, [SHOP])
+
+    assert wait_until(lambda: seen["finished"] == [("못 찾겠어요.", False)])
+    assert executor.done == []
+    assert "쓸 수 없는 동작이었다" in chooser.prompts[1]
+
+
+def test_pressing_something_named_like_a_risk_asks_first(run_chooser, wait_until):
+    chooser = Chooser(choose(action="press", number=4))
+
+    _, executor, seen = run_chooser(chooser, [RESULTS], confirm=False)
+
+    assert wait_until(lambda: seen["finished"] == [(REFUSED, False)])
+    assert "삭제" in seen["asked"][0] and executor.done == []
+
+
+def test_agent_is_told_when_a_press_changed_nothing(run_chooser, wait_until):
+    chooser = Chooser(choose(action="press", number=3), choose(action="done", why="끝"))
+
+    run_chooser(chooser, [SHOP, SHOP])
+
+    assert wait_until(lambda: len(chooser.prompts) == 2)
+    assert "(방금 누른 뒤에도 화면이 그대로다)" in chooser.prompts[1]
+
+
+def test_a_window_that_lists_almost_nothing_is_worked_by_looking_at_the_picture(run_chooser, wait_until):
+    bare = page(("버튼", "확인"))
+    engine = FakeEngine(CLICK, DONE)
+    chooser = Chooser()
+
+    _, executor, seen = run_chooser(chooser, [bare], engine=engine)
+
+    assert wait_until(lambda: seen["finished"] == [("다 썼어요.", True)])
+    assert chooser.prompts == [] and len(engine.prompts) == 2

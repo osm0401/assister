@@ -54,6 +54,15 @@ def test_changed_values_come_back_as_new_settings_and_profile(dialog):
     }
 
 
+def test_ai_engine_can_be_switched_to_gemini(dialog):
+    assert dialog.engine.currentData() == "ollama"
+    assert "GEMINI_API_KEY" in dialog.engine.toolTip() and "Google 서버" in dialog.engine.toolTip()
+
+    dialog.engine.setCurrentIndex(dialog.engine.findData("gemini"))
+
+    assert dialog.result_values()[0].engine == "gemini"
+
+
 def test_untouched_settings_are_kept(dialog):
     settings, _ = dialog.result_values()
 

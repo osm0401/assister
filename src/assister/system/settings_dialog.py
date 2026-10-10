@@ -97,6 +97,18 @@ class SettingsDialog(QDialog):
         self.blocked.setPlaceholderText("한 줄에 하나씩. 창 제목이나 프로그램 이름에 이 낱말이 있으면 보지 않습니다")
         self.blocked.setFixedHeight(64)
 
+        self.engine = QComboBox()
+        self.engine.addItem("내 PC (Ollama)", "ollama")
+        self.engine.addItem("Google Gemini", "gemini")
+        self.engine.addItem("Antigravity CLI (agy)", "agy")
+        self.engine.setCurrentIndex(max(0, self.engine.findData(settings.engine)))
+        self.engine.setToolTip(
+            "Gemini를 고르면 대화와 화면 그림이 Google 서버로 나갑니다. "
+            "API 키는 환경 변수 GEMINI_API_KEY에 넣어 두어야 합니다. "
+            "agy는 키 없이 Antigravity 로그인으로 대화만 맡습니다. 답이 7초쯤 걸리고, "
+            "화면 보기와 PC 조작은 Ollama가 계속 맡습니다."
+        )
+
         self.summon_hotkey = QLineEdit(settings.summon_hotkey)
         self.voice_hotkey = QLineEdit(settings.voice_hotkey)
 
@@ -125,6 +137,7 @@ class SettingsDialog(QDialog):
             ("먼저 말 걸기 (시간당)", self.proactive),
             ("가릴 프로그램", self.blocked),
             ("", self.rest_when_fullscreen),
+            ("AI 엔진", self.engine),
             ("부르는 단축키", self.summon_hotkey),
             ("음성 입력 단축키", self.voice_hotkey),
             ("", self.autostart),
@@ -165,6 +178,7 @@ class SettingsDialog(QDialog):
         settings = replace(
             self._settings,
             character=self.character.currentText(),
+            engine=self.engine.currentData(),
             screen_interval_sec=self.interval.value(),
             screen_retention_days=self.retention.value(),
             proactive_per_hour=self.proactive.value(),

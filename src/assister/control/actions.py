@@ -61,6 +61,12 @@ SYSTEM_TOOLS = frozenset({
 })  # fmt: skip
 # 이런 프로그램에서 Enter는 메시지나 메일을 보내는 일이다.
 MESSAGING = ("kakaotalk", "카카오톡", "discord", "slack", "telegram", "whatsapp", "outlook", "메일", "mail", "teams")
+# AI가 부르는 이름과 Windows가 아는 이름이 다른 프로그램. 'word'로는 열리지 않았다(실제로 봄).
+OPEN_NAMES = {
+    "word": "winword", "워드": "winword", "excel": "excel", "엑셀": "excel",
+    "powerpoint": "powerpnt", "파워포인트": "powerpnt", "메모장": "notepad", "계산기": "calc",
+    "그림판": "mspaint", "탐색기": "explorer", "크롬": "chrome", "엣지": "msedge",
+}  # fmt: skip
 SAFE_TO_OPEN = re.compile(r"https?://\S+|[\w .-]+", re.IGNORECASE)
 RUNNABLE = re.compile(r"\.(exe|msi|bat|cmd|ps1|vbs|js|scr|lnk|reg)$", re.IGNORECASE)
 
@@ -129,7 +135,9 @@ def parse_action(raw: object) -> Action:
             text = raw.get("target")  # 모델이 프로그램 이름을 target 칸에 적을 때가 있다
         if not isinstance(text, str) or not text.strip():
             raise ActionError(f"{kind}에는 text가 필요합니다")
-        return Action(kind, why, text=text if kind == "type" else text.strip(), risky=risky)
+        if kind == "open":
+            text = OPEN_NAMES.get(text.strip().lower(), text.strip())
+        return Action(kind, why, text=text, risky=risky)
     if kind == "key":
         return Action(kind, why, keys=_normal_keys(str(raw.get("keys") or "")), risky=risky)
     if kind == "wait":

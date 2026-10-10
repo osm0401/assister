@@ -8,13 +8,16 @@ AI가 잘못된 값을 주는 일도 흔하므로, 그럴 때는 예외를 던�
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from assister.ai.search import Hit, SearchError
 from assister.memory.store import MemoryStore
+from assister.system.documents import FOLDER_NAMES
 from assister.system.shell import CommandResult, ShellError, risk_reason
 from assister.tasks.models import Alarm
 from assister.tasks.repository import TaskRepository
@@ -23,6 +26,18 @@ from assister.tasks.service import format_time
 MAX_MINUTES = 60 * 24 * 365
 MAX_DAY_OFFSET = 365
 REPEATS = ("", "daily")
+# 사용자의 하루를 적어 달라는 말을 알아보는 낱말들.
+# ponytail: 낱말만 본다. '오늘 하루 식단 추천' 같은 말도 하루 기록으로 보니, 그런 일이 잦으면 AI에게 가르게 한다.
+DAYS_AGO = (("그저께", -2), ("엊그제", -2), ("그제", -2), ("어제", -1), ("오늘", 0))
+OWN_DAY = re.compile(r"있었던|한\s?일|했던|했는지|뭐\s?했|하루|일과|일기|활동")
+RECORD_NOTE = (
+    "남아 있는 기록을 그대로 옮겼습니다. 기록에 없는 일은 적지 않았습니다. "
+    "화면 기록은 AI가 화면을 보고 적은 것이라 틀린 데가 있을 수 있습니다."
+)
+WRITTEN_NOTE = (
+    "이 글은 AI가 아는 대로 쓴 것입니다. 사용자의 기록이나 일정을 보고 쓴 것이 아니며, 틀린 내용이 있을 수 있습니다."
+)
+SPEAKERS = {"user": "나", "assistant": "캐릭터"}
 MAX_REVIEW_DAYS = 7  # 화면 기록을 보관하는 기본 기간
 REVIEW_SLOT_MINUTES = 30
 
@@ -102,6 +117,17 @@ SCHEMAS = [
         {"command": {"type": "string", "description": "PowerShell 명령. 예: Get-ChildItem $Downloads"}},
         ["command"],
     ),
+    _schema(
+        "write_document",
+        "어떤 주제에 대한 글을 직접 써서 워드 파일(.docx)로 저장한다. '…를 정리해서 워드 파일로 저장해 줘', "
+        "'…에 대한 문서 만들어 줘'처럼 내용을 써 달라는 부탁에 쓴다. 화면을 조작하지 않고 파일을 바로 만든다.",
+        {
+            "topic": {"type": "string", "description": "무엇에 대해 어떻게 쓸지. 사용자가 부탁한 말을 살려서. 예: API가 무엇인지 자세하게"},
+            "filename": {"type": "string", "description": "파일 이름. 확장자는 뺀다. 예: API 정리"},
+            "folder": {"type": "string", "description": "저장할 곳. desktop, documents, downloads 중 하나. 말하지 않았으면 documents"},
+        },
+        ["topic", "filename"],
+    ),
 ]
 
 
@@ -122,6 +148,27 @@ def _action_format(schemas: list[dict]) -> dict:
 
 
 ACTION_FORMAT = _action_format(SCHEMAS)
+# 대화 기록에 '무엇을 했는지' 한 줄로 남길 작업과, 그 줄에 적을 칸.
+NOTABLE = {
+    "run_command": ("명령", "command"),
+    "web_search": ("검색", "query"),
+    "control_pc": ("조작", "goal"),
+    "write_document": ("문서 쓰는 중", "filename"),
+}
+
+
+def day_asked(text: str) -> int | None:
+    """사용자의 하루를 적어 달라는 말이면 며칠 전인지(오늘 0, 어제 -1). 그런 말이 아니면 None."""
+    if not OWN_DAY.search(text):
+        return None
+    return next((offset for word, offset in DAYS_AGO if word in text), None)
+
+
+def action_note(name: str, arguments: dict) -> str:
+    """대화 기록에 남길 한 줄. 알람·할 일처럼 확인 문장이 따로 나오는 작업은 빈 글."""
+    label, key = NOTABLE.get(name, ("", ""))
+    detail = str(arguments.get(key) or "").strip() if key else ""
+    return f"{label} · {detail}" if detail else ""
 
 
 @dataclass(frozen=True)
@@ -173,13 +220,19 @@ class ToolBox:
         search: Callable[[str], list[Hit]] | None = None,
         shell: Callable[[str], CommandResult] | None = None,
         confirm: Callable[[str], bool] | None = None,
+        write: Callable[[str], str] | None = None,
+        save_document: Callable[[str, str, str], Path] | None = None,
     ) -> None:
         """start_control은 PC 조작을 시작시키는 함수다. 시작했으면 True, 이미 다른 조작 중이면 False를 돌려준다.
 
         search는 인터넷에서 검색해 결과를 돌려주는 함수다. 못 하면 SearchError를 낸다.
         shell은 PowerShell 명령을 실행하는 함수고, confirm은 위험해 보이는 명령을 실행해도 되는지
         사용자에게 물어 답을 돌려주는 함수다. confirm이 없으면 그런 명령은 실행하지 않는다.
+        write는 주제를 받아 문서에 들어갈 글을 써 주는 함수고, save_document는 (폴더 종류, 파일 이름, 글)을
+        받아 워드 파일로 저장한 자리를 돌려주는 함수다.
         """
+        self._write = write
+        self._save_document = save_document
         self._tasks = tasks
         self._memory = memory
         self._start_control = start_control
@@ -189,6 +242,7 @@ class ToolBox:
         self._handlers = {
             "web_search": self._web_search,
             "run_command": self._run_command,
+            "write_document": self._write_document,
             "review_day": self._review_day,
             "control_pc": self._control_pc,
             "add_alarm": self._add_alarm,
@@ -298,12 +352,8 @@ class ToolBox:
         done = self._tasks.complete_todo(todos[number - 1].id)
         return Outcome(f"'{done.text}' 끝낸 걸로 표시했어요.")
 
-    def _review_day(self, arguments: dict, now: datetime) -> Outcome:
-        offset = _integer(arguments, "day_offset") or 0
-        if not -MAX_REVIEW_DAYS <= offset <= 0:
-            raise ToolError(f"화면 기록은 오늘부터 {MAX_REVIEW_DAYS}일 전까지만 볼 수 있습니다")
-        day = now + timedelta(days=offset)
-        # 하루치 기록은 수천 줄이 될 수 있어, 30분에 하나씩만 추려서 AI에게 보여 준다.
+    def _day_notes(self, day: datetime) -> list[str]:
+        """그날 화면에서 본 것. 하루치는 수천 줄이 될 수 있어 30분에 하나씩만 추린다."""
         seen: set[tuple[int, int]] = set()
         lines = []
         for note in self._memory.screen_notes_on(day):
@@ -311,9 +361,41 @@ class ToolBox:
             if slot not in seen:
                 seen.add(slot)
                 lines.append(f"- {format_time(note.created_at, note.created_at)} {note.summary}")
+        return lines
+
+    def _review_day(self, arguments: dict, now: datetime) -> Outcome:
+        offset = _integer(arguments, "day_offset") or 0
+        if not -MAX_REVIEW_DAYS <= offset <= 0:
+            raise ToolError(f"화면 기록은 오늘부터 {MAX_REVIEW_DAYS}일 전까지만 볼 수 있습니다")
+        day = now + timedelta(days=offset)
+        lines = self._day_notes(day)
         if not lines:
-            return Outcome(f"{day.month}월 {day.day}일에는 화면 기록이 없음", shown=False)
-        return Outcome(f"{day.month}월 {day.day}일에 사용자의 화면에서 본 것\n" + "\n".join(lines), shown=False)
+            # 기록이 없다는 말은 프로그램이 직접 한다. AI에게 맡기면 없는 하루를 지어내곤 한다.
+            return Outcome(f"{day.month}월 {day.day}일에는 남은 화면 기록이 없어요.")
+        header = f"{day.month}월 {day.day}일에 사용자의 화면에서 본 것. 여기 적힌 것만 말하고, 적히지 않은 일은 지어내지 않는다."
+        return Outcome(header + "\n" + "\n".join(lines), shown=False)
+
+    def _day_record(self, day: datetime, request: str) -> tuple[str, int, int] | None:
+        """그날 남은 기록을 그대로 옮긴 글과 (화면 기록 수, 대화 수). 남은 기록이 없으면 None."""
+        notes = self._day_notes(day)
+        talk = [
+            f"- {format_time(message.created_at, message.created_at)} {SPEAKERS.get(message.role, message.role)}: "
+            + " ".join(message.content.split())
+            for message in self._memory.messages_on(day.date())
+            if message.content != request  # 이 문서를 만들어 달라는 지금 이 말은 뺀다
+        ]
+        if not notes and not talk:
+            return None
+        nothing = ["- 남은 기록 없음"]
+        lines = [
+            f"{day.year}년 {day.month}월 {day.day}일에 있었던 일",
+            RECORD_NOTE,
+            "# 화면에서 본 것",
+            *(notes or nothing),
+            "# 나눈 대화",
+            *(talk or nothing),
+        ]
+        return "\n".join(lines), len(notes), len(talk)
 
     def _control_pc(self, arguments: dict, now: datetime) -> Outcome:
         goal = _text(arguments, "goal")
@@ -363,6 +445,37 @@ class ToolBox:
             "이미 끝난 일이니 한 일을 그대로 알려 주고, 출력에 없는 것은 지어내지 않는다."
         )
         return Outcome(f"{header}\n{result.output or '(출력 없음)'}", shown=False, ok=result.exit_code == 0)
+
+    def _write_document(self, arguments: dict, now: datetime) -> Outcome:
+        topic = _text(arguments, "topic")
+        if self._write is None or self._save_document is None:
+            raise ToolError("문서 쓰기를 쓸 수 없습니다")
+        folder = str(arguments.get("folder") or "").strip().lower()
+        folder = folder if folder in FOLDER_NAMES else "documents"
+        request = str(arguments.get("request") or "")
+        basis = ""
+        days_ago = day_asked(f"{request} {topic}")
+        if days_ago is not None:
+            # 사용자의 하루는 AI가 알 길이 없다. 쓰게 하면 그럴듯하게 지어내므로(실제로 그랬다) 남은 기록만 옮긴다.
+            day = now + timedelta(days=days_ago)
+            record = self._day_record(day, request)
+            if record is None:
+                return Outcome(f"{day.month}월 {day.day}일은 남은 기록이 없어서 문서를 만들지 않았어요.")
+            text, notes, talk = record
+            basis = f" 남아 있는 기록(화면 {notes}개, 대화 {talk}마디)만 옮겼고 지어낸 내용은 없어요."
+        else:
+            title, _, body = self._write(topic).strip().partition("\n")
+            if not title:
+                raise ToolError("문서에 쓸 글을 만들지 못했습니다")
+            # AI가 쓴 글은 그렇다고 문서 맨 위와 답에 밝혀 둔다. 회의 안건처럼 사용자만 아는 것을 써 달라고 해도
+            # 그럴듯하게 지어내고, 그것을 미리 가려내지도 못했다(실제 모델로 14개 중 9개만 맞힘).
+            text = f"{title}\n{WRITTEN_NOTE}\n{body}"
+            basis = " AI가 아는 대로 쓴 글이라 틀린 데가 있을 수 있고, 사용자만 아는 일은 들어 있지 않아요."
+        try:
+            path = self._save_document(folder, str(arguments.get("filename") or topic), text)
+        except OSError as error:
+            raise ToolError(f"파일을 저장하지 못했습니다: {error}") from error
+        return Outcome(f"'{path.name}' 파일을 {FOLDER_NAMES[folder]} 폴더에 저장했어요.{basis}")
 
     def _remember(self, arguments: dict, now: datetime) -> Outcome:
         text = _text(arguments, "fact")

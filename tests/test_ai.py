@@ -8,8 +8,9 @@ from assister.ai.chat import FALLBACK_REPLY, MAX_ACTIONS, ChatSession
 from assister.ai.engine import EngineError, OllamaEngine
 from assister.ai.prompt import build_planner_prompt, build_system_prompt, format_now
 from assister.ai.search import Hit, SearchError
-from assister.ai.tools import ACTION_FORMAT, Outcome, ToolBox
+from assister.ai.tools import ACTION_FORMAT, RECORD_NOTE, WRITTEN_NOTE, Outcome, ToolBox, day_asked
 from assister.memory.store import MemoryStore
+from assister.system.documents import save_docx
 from assister.system.shell import CommandResult
 from assister.tasks.repository import TaskRepository
 
@@ -403,7 +404,9 @@ def test_review_day_gives_the_ai_a_timeline_of_what_was_on_screen(toolbox, store
 
 
 def test_review_day_says_so_when_nothing_was_recorded_or_the_day_is_out_of_range(toolbox):
-    assert "기록이 없" in toolbox.execute("review_day", {"day_offset": -1}, NOW).text
+    nothing = toolbox.execute("review_day", {"day_offset": -1}, NOW)
+    # 기록이 없다는 말은 프로그램이 직접 한다. AI에게 맡기면 없는 하루를 지어낸다.
+    assert nothing.shown and "기록이 없" in nothing.text
     assert not toolbox.execute("review_day", {"day_offset": 3}, NOW).ok
     assert not toolbox.execute("review_day", {"day_offset": -30}, NOW).ok
 
@@ -509,6 +512,103 @@ def test_run_command_tool_reports_failures(stores):
     assert not ToolBox(*stores).execute("run_command", {"command": "Get-ChildItem"}, NOW).ok
 
 
+def test_write_document_tool_writes_the_text_itself_and_saves_it(stores, tmp_path):
+    asked = []
+
+    def write(topic):
+        asked.append(topic)
+        return "API란\nAPI는 약속이다."
+
+    texts = []
+
+    def save(kind, name, text):
+        texts.append(text)
+        return save_docx(tmp_path / kind, name, text)
+
+    toolbox = ToolBox(*stores, write=write, save_document=save)
+    request = {"topic": "API가 무엇인지 자세하게", "filename": "API 정리", "folder": "downloads"}
+
+    outcome = toolbox.execute("write_document", request, NOW)
+
+    assert asked == ["API가 무엇인지 자세하게"]
+    assert (tmp_path / "downloads" / "API 정리.docx").exists()
+    # AI가 쓴 글이라는 것을 제목 바로 아래와 답에 밝힌다. 기록을 보고 쓴 글로 잘못 알면 안 된다.
+    assert texts[0].splitlines() == ["API란", WRITTEN_NOTE, "API는 약속이다."]
+    # 어디에 무슨 이름으로 저장했는지는 프로그램이 사실대로 알려 준다.
+    assert outcome.shown and outcome.text.startswith("'API 정리.docx' 파일을 다운로드 폴더에 저장했어요.")
+    assert "AI가 아는 대로 쓴 글" in outcome.text
+
+
+def test_write_document_tool_uses_the_documents_folder_unless_told_and_reports_trouble(stores, tmp_path):
+    kinds = []
+    toolbox = ToolBox(
+        *stores, write=lambda topic: "글", save_document=lambda kind, name, text: kinds.append(kind) or tmp_path / f"{name}.docx"
+    )
+
+    assert "문서 폴더" in toolbox.execute("write_document", {"topic": "회의록", "filename": "회의록", "folder": "어딘가"}, NOW).text
+    assert kinds == ["documents"]
+
+    wordless = ToolBox(*stores, write=lambda topic: "  ", save_document=lambda kind, name, text: tmp_path / "x.docx")
+    assert not wordless.execute("write_document", {"topic": "회의록", "filename": "회의록"}, NOW).ok
+    assert not ToolBox(*stores).execute("write_document", {"topic": "회의록", "filename": "회의록"}, NOW).ok
+
+
+@pytest.mark.parametrize(
+    ("said", "days_ago"),
+    [
+        ("워드 파일에 오늘 있었던일 정리해서 다운로드에 생성해줘", 0),
+        ("어제 내가 뭐 했는지 문서로 만들어 줘", -1),
+        ("그저께 한 일 정리", -2),
+        ("API가 무엇인지 자세하게", None),
+        ("오늘 날씨 정리", None),
+        ("하루 10분 운동법", None),  # 하루 이야기지만 어느 날인지 말하지 않았다
+    ],
+)
+def test_asking_about_one_s_own_day_is_told_apart_from_other_topics(said, days_ago):
+    assert day_asked(said) == days_ago
+
+
+def test_document_about_the_user_s_day_copies_the_records_and_never_lets_the_ai_write(stores, tmp_path):
+    tasks, memory = stores
+    request = "워드 파일에 오늘 있었던일 정리해서 다운로드에 생성해줘"
+    memory.add_screen_note("코드 편집기에서 파이썬 파일을 고치고 있다.", "Code", NOW.replace(hour=14, minute=5))
+    memory.add_message("user", "API가 뭐야?", NOW.replace(hour=14, minute=10))
+    memory.add_message("assistant", "프로그램끼리의\n약속이에요.", NOW.replace(hour=14, minute=10))
+    memory.add_message("user", request, NOW)
+    texts = []
+
+    def never(topic):
+        raise AssertionError("사용자의 하루를 AI에게 쓰게 하면 지어낸다")
+
+    toolbox = ToolBox(tasks, memory, write=never, save_document=lambda kind, name, text: texts.append(text) or tmp_path / "오늘.docx")
+    asked = {"topic": "하루 정리", "filename": "오늘", "folder": "downloads", "request": request}
+
+    outcome = toolbox.execute("write_document", asked, NOW)
+
+    assert texts[0].splitlines() == [
+        "2026년 10월 6일에 있었던 일",
+        RECORD_NOTE,
+        "# 화면에서 본 것",
+        "- 오후 2:05 코드 편집기에서 파이썬 파일을 고치고 있다.",
+        "# 나눈 대화",
+        "- 오후 2:10 나: API가 뭐야?",
+        "- 오후 2:10 캐릭터: 프로그램끼리의 약속이에요.",
+    ]
+    assert outcome.shown and "화면 1개, 대화 2마디" in outcome.text and "지어낸 내용은 없어요" in outcome.text
+
+
+def test_no_document_is_made_about_a_day_with_no_records(stores, tmp_path):
+    texts = []
+    toolbox = ToolBox(
+        *stores, write=lambda topic: "지어낸 하루", save_document=lambda kind, name, text: texts.append(text) or tmp_path / "x.docx"
+    )
+
+    outcome = toolbox.execute("write_document", {"topic": "어제 있었던 일", "filename": "어제"}, NOW)
+
+    assert texts == []
+    assert outcome.shown and "10월 5일은 남은 기록이 없어서" in outcome.text
+
+
 def test_state_summary_numbers_todos_and_alarms_for_the_planner(toolbox):
     assert toolbox.state_summary(NOW) == "[지금 남은 할 일]\n없음\n\n[지금 울릴 알람]\n없음"
 
@@ -604,6 +704,23 @@ def test_search_results_reach_the_answering_ai(stores):
 
     assert session.reply("오늘 서울 날씨 어때?") == "오늘 서울은 맑대요."
     assert "서울 맑음" in engine.chat_calls[0][0]["content"]
+
+
+def test_what_the_user_actually_said_decides_whether_the_day_s_records_are_used(stores, tmp_path):
+    tasks, memory = stores
+    memory.add_message("user", "점심 뭐 먹지", NOW.replace(hour=12))
+    texts = []
+    toolbox = ToolBox(
+        tasks, memory, write=lambda topic: "지어낸 하루", save_document=lambda kind, name, text: texts.append(text) or tmp_path / "하루.docx"
+    )
+    engine = FakeEngine(plans=[plan({"tool": "write_document", "topic": "일과 요약", "filename": "하루"})])
+    session = ChatSession(engine, memory, toolbox, character_name="모모", clock=lambda: NOW)
+
+    reply = session.reply("오늘 있었던 일 워드로 정리해 줘")
+
+    # AI가 주제를 '일과 요약'으로 옮겨 적었어도, 사용자가 '오늘 있었던 일'이라고 했으니 기록만 옮긴다.
+    assert "점심 뭐 먹지" in texts[0] and "지어낸 하루" not in texts[0]
+    assert "지어낸 내용은 없어요" in reply
 
 
 def test_earlier_turns_are_sent_as_history(stores):

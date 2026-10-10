@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import fields, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from PySide6.QtCore import QLockFile, QObject, QPoint, QProcess, Qt, QTimer
+from PySide6.QtCore import QLockFile, QObject, QProcess, Qt, QTimer
 from PySide6.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from assister import paths
+from assister.ai.agy import AgyEngine
 from assister.ai.chat import ChatSession
-from assister.ai.engine import ChatEngine, OllamaEngine, start_ollama
+from assister.ai.engine import ChatEngine, EngineError, OllamaEngine, start_ollama
+from assister.ai.gemini import GeminiEngine
+from assister.ai.prompt import WRITER
 from assister.ai.search import search
 from assister.ai.tools import ToolBox
 from assister.ai.worker import ChatWorker
@@ -21,6 +25,7 @@ from assister.character.art import generate_placeholder_pack
 from assister.character.pack import CharacterPack, PackError, Voice, list_packs, load_pack, save_profile
 from assister.character.stage import CharacterStage
 from assister.config import Settings, SettingsError, load_settings, save_settings
+from assister.control import elements
 from assister.control.agent import ControlAgent
 from assister.control.executor import Win32Executor
 from assister.growth.bond import (
@@ -38,12 +43,12 @@ from assister.memory.store import MemoryStore
 from assister.screen.capture import take_snapshot
 from assister.screen.privacy import DEFAULT_SENSITIVE
 from assister.screen.watcher import ScreenWatcher
-from assister.system import autostart, shell
+from assister.system import autostart, documents, shell
 from assister.system.hotkey import GlobalHotkey, HotkeyError
 from assister.system.settings_dialog import SettingsDialog
 from assister.system.tray import AppMenu
 from assister.tasks.repository import TaskRepository
-from assister.tasks.service import Reply, TaskService
+from assister.tasks.service import Reply, TaskService, format_time
 from assister.voice.listener import MicListener
 from assister.voice.sentences import SentenceSplitter, speakable
 from assister.voice.stt import Transcriber
@@ -59,6 +64,8 @@ WAKING_UP = "잠깐만요, 아직 머리를 깨우는 중이에요. 처음에는
 BOND_KEY = "bond_points"
 WAKE_ACK = "네?"
 STOP_KEY = "Esc"
+HISTORY_SHOWN = 60  # 켤 때 패널의 대화 기록에 채워 둘 예전 말의 수
+SCREEN_NOTES_SHOWN = 30
 SIMPLE_COMMAND_HINT = "그동안 알람과 할 일은 '10분 뒤 빨래', '할 일 추가 우유 사기'처럼 말하면 돼요."
 
 
@@ -93,6 +100,17 @@ def restart() -> None:
     """같은 앱을 새로 띄우고 지금 것은 끈다. 새 앱은 검은 명령 창 없이 뜬다."""
     QProcess.startDetached(autostart.windowless_python(), ["-m", "assister"], str(paths.project_root()))
     QApplication.quit()
+
+
+def make_engine(settings: Settings) -> ChatEngine:
+    """설정에서 고른 AI 엔진. Gemini는 대화와 화면 그림을 Google 서버로 보낸다."""
+    if settings.engine == "gemini":
+        return GeminiEngine(settings.gemini_model)
+    if settings.engine == "agy":
+        return AgyEngine(settings.agy_model)
+    return OllamaEngine(
+        settings.model, base_url=settings.ollama_url, num_ctx=settings.num_ctx, start_server=start_ollama
+    )
 
 
 def load_character(settings: Settings) -> CharacterPack:
@@ -135,9 +153,10 @@ class DesktopFriend(QObject):
         self.tasks = TaskService(self.repository)
 
         settings = self._settings
-        self._engine = engine or OllamaEngine(
-            settings.model, base_url=settings.ollama_url, num_ctx=settings.num_ctx, start_server=start_ollama
-        )
+        self._engine = engine or make_engine(settings)
+        # 그림을 읽지 못하는 엔진(agy)을 쓸 때는 화면 보기와 PC 조작을 내 PC의 Ollama가 맡는다.
+        sees = getattr(self._engine, "sees_images", True)
+        self._eyes = self._engine if sees else make_engine(replace(settings, engine="ollama"))
         session = ChatSession(
             self._engine,
             self.memory,
@@ -149,6 +168,8 @@ class DesktopFriend(QObject):
                 search=search,
                 shell=shell.run,
                 confirm=lambda text: self.chat.confirm(text),
+                write=lambda topic: self._engine.chat([{"role": "user", "content": WRITER.format(topic=topic)}]),
+                save_document=lambda kind, name, text: documents.save_docx(documents.known_folder(kind), name, text),
             ),
             character_name=self.pack.name,
             persona=self.pack.persona,
@@ -163,7 +184,7 @@ class DesktopFriend(QObject):
             VoiceRouter(self.pack.wake_names, wake_enabled=settings.wake_word_enabled),
         )
         self.watcher = watcher or ScreenWatcher(
-            self._engine,
+            self._eyes,
             self.memory,
             interval_sec=settings.screen_interval_sec,
             retention_days=settings.screen_retention_days,
@@ -174,12 +195,15 @@ class DesktopFriend(QObject):
             is_busy=lambda: self._replying or self._voice_busy or self.agent.running,
         )
         self.agent = agent or ControlAgent(
-            self._engine,
+            self._eyes,
             Win32Executor(),
             take_snapshot=take_snapshot,
             keywords=self._hidden_keywords,
             width=settings.control_width,
             max_steps=settings.control_max_steps,
+            # 누를 수 있는 것의 목록에서 고르는 일은 글만 읽으면 되니 대화 엔진이 맡는다.
+            chooser=self._engine,
+            list_elements=elements.look,
         )
         self._stop_hotkey: GlobalHotkey | None = None
         self._permission: QMessageBox | None = None
@@ -188,9 +212,7 @@ class DesktopFriend(QObject):
             self.watcher.set_enabled(False)
         self._last_offer = datetime.now()
 
-        self.stage = CharacterStage(
-            self.pack, settings.outfit, settings.character_height, always_show_input=settings.always_show_input
-        )
+        self.stage = CharacterStage(self.pack, settings.outfit)
         self.menu = AppMenu(
             self.pack,
             outfit=settings.outfit,
@@ -206,7 +228,7 @@ class DesktopFriend(QObject):
         self._hotkeys = [
             hotkey
             for hotkey in (
-                self._register_hotkey(settings.summon_hotkey, self.stage.summon),
+                self._register_hotkey(settings.summon_hotkey, self.stage.toggle),
                 self._register_hotkey(settings.voice_hotkey, self.listener.arm),
             )
             if hotkey is not None
@@ -231,7 +253,10 @@ class DesktopFriend(QObject):
         self.stage.clicked.connect(self.stage.summon)
         self.stage.mic_clicked.connect(self.listener.arm)
         self.stage.menu_requested.connect(self.menu.popup)
-        self.stage.position_changed.connect(self._on_moved)
+        self.stage.moved.connect(lambda x, y: self._update_settings(panel_position=(x, y)))
+        self.stage.resized.connect(lambda width, height: self._update_settings(panel_size=(width, height)))
+        # 왼쪽 자리로 되돌리면 자리와 크기를 잊는다. 그래야 화면 해상도가 바뀌어도 1/4에 맞춰진다.
+        self.stage.docked.connect(lambda: self._update_settings(panel_position=None, panel_size=None))
 
         self.menu.do_not_disturb_toggled.connect(self._on_do_not_disturb)
         self.menu.tts_toggled.connect(self._on_tts_toggled)
@@ -253,6 +278,7 @@ class DesktopFriend(QObject):
         self.chat.finished.connect(self._on_answer_finished)
         self.chat.failed.connect(self._on_answer_failed)
         self.chat.confirm_needed.connect(lambda text: self._ask_permission(text, self.chat.answer))
+        self.chat.action_taken.connect(self.stage.note)
 
         self.speaker.started.connect(self._on_voice_started)
         self.speaker.finished.connect(self._on_voice_finished)
@@ -274,16 +300,27 @@ class DesktopFriend(QObject):
         )
 
     def start(self) -> None:
-        self.stage.show(self._settings.position)
+        self.stage.load_history((message.role, message.content) for message in self.memory.recent_messages(HISTORY_SHOWN))
+        self.stage.show(self._settings.panel_position, self._settings.panel_size)
+        self._show_lists()
         self.menu.show_tray()
         self._alarm_timer.start(ALARM_CHECK_MS)
         self._mood_timer.start(MOOD_CHECK_MS)
         self._show_mood()
         self.chat.warm_up()
+        if self._eyes is not self._engine:
+            # 대화 엔진과 따로 도는 Ollama도 미리 켜고 모델을 올려 둔다. 오래 걸려서 뒤에서 한다.
+            threading.Thread(target=self._warm_eyes, name="warm-eyes", daemon=True).start()
         self.listener.start()
         self.stage.input_bar.set_eye_state("watching" if self._settings.screen_watch_enabled else "off")
         self.watcher.start()
         self._say(Reply("\n".join([self._greeting(), *self._notices]), "smile"))
+
+    def _warm_eyes(self) -> None:
+        try:
+            self._eyes.warm_up()
+        except EngineError as error:
+            log.warning("화면을 읽을 AI를 올리지 못했습니다: %s", error)
 
     def _greeting(self) -> str:
         """켤 때 하는 인사. 남은 할 일과 알람이 있으면 몇 개인지 알려 준다."""
@@ -308,6 +345,8 @@ class DesktopFriend(QObject):
         self.speaker.shutdown()
         self.chat.shutdown()
         self._engine.close()
+        if self._eyes is not self._engine:
+            self._eyes.close()
         self.menu.close()
         self.stage.close()
         self.repository.close()
@@ -448,13 +487,14 @@ class DesktopFriend(QObject):
             self.stage.release()
 
     def _settle_face(self) -> None:
-        """말을 마친 뒤, 방금 한 말에 어울리는 표정을 말풍선이 사라질 때까지 짓는다."""
+        """말을 마친 뒤, 방금 한 말에 어울리는 표정을 한동안 짓는다."""
         if face := reaction(self._answer):
             self.stage.set_expression(face)
 
     # ---------- 듣기와 답하기 ----------
 
     def _on_submitted(self, text: str) -> None:
+        self.stage.show_user(text)
         self._grow()
         # 새로 말을 걸면 하던 말을 끊는다.
         self.speaker.stop()
@@ -492,16 +532,18 @@ class DesktopFriend(QObject):
         self.stage.stream(f"{reply}\n{news}" if news else reply)
         self._speak([*self._splitter.flush(), news])
         self._answer = reply
-        # 목소리로 읽는 중이면 다 읽을 때까지 말풍선을 붙잡아 둔다.
+        # 목소리로 읽는 중이면 다 읽을 때까지 말하는 중으로 둔다.
         if not self._voice_busy:
             self._settle_face()
             self.stage.release()
+        self._show_lists()
 
     def _on_answer_failed(self, message: str) -> None:
         self._replying = False
         # AI가 꺼져 있어도 간단한 알람·할 일 명령은 알아듣는다.
         fallback = self.tasks.handle(self._asked, datetime.now()) if self._asked else None
         self._say(fallback or Reply(message, "sad"), aloud=fallback is not None)
+        self._show_lists()
 
     def _on_model_ready(self) -> None:
         self._model_ready = True
@@ -523,7 +565,23 @@ class DesktopFriend(QObject):
         return mood_at(now, self.memory.count_user_messages_on(now))
 
     def _show_mood(self) -> None:
-        self.stage.set_idle_expression(idle_expression(self._mood()))
+        mood = self._mood()
+        self.stage.set_idle_expression(idle_expression(mood))
+        left = points_to_next(self._points)
+        progress = f"다음 레벨까지 {left}" if left is not None else "가장 높은 레벨"
+        self.stage.panel.show_status(f"친밀도 레벨 {level_for(self._points)} · {progress} · {mood.value}")
+
+    def _show_lists(self) -> None:
+        """패널의 할 일·알람과 오늘 화면 기록을 지금 것으로 바꾼다."""
+        now = datetime.now()
+        todos = [todo.text for todo in self.repository.list_todos()]
+        alarms = [
+            f"{'매일 ' if alarm.repeat == 'daily' else ''}{format_time(alarm.due_at, alarm.due_at if alarm.repeat == 'daily' else now)} {alarm.message}"
+            for alarm in self.repository.list_pending_alarms()
+        ]
+        notes = [f"{format_time(note.created_at, now)} {note.summary}" for note in self.memory.screen_notes_on(now)]
+        self.stage.panel.show_tasks(todos, alarms)
+        self.stage.panel.show_screen_notes(notes[-SCREEN_NOTES_SHOWN:][::-1])
 
     def _grow(self) -> None:
         """사용자가 한 마디 할 때마다 친밀도가 1 오른다. 레벨이 오르면 옷과 소품이 열린다."""
@@ -532,6 +590,7 @@ class DesktopFriend(QObject):
         self.memory.set_state(BOND_KEY, self._points)
         new = level_for(self._points)
         self.menu.set_level(new, points_to_next(self._points))
+        self._show_mood()
         if new > old:
             opened = newly_unlocked(self.pack, old_level=old, new_level=new)
             self._news = f"친밀도 레벨 {new}이 됐어요!" + (f" 새로 열린 것: {', '.join(opened)}" if opened else "")
@@ -553,6 +612,8 @@ class DesktopFriend(QObject):
             self._say(Reply("멈춤 키(Esc)를 쓸 수 없어서 대신 조작하지 않을게요.", "sad"))
             return
         self._stop_hotkey.pressed.connect(self.agent.stop)
+        # 패널이 화면의 1/4을 덮고 있으면 그 밑을 누를 수 없으니, 조작하는 동안에는 비켜 준다.
+        self.stage.hide()
 
     def _release_stop_key(self) -> None:
         if self._stop_hotkey is not None:
@@ -595,6 +656,7 @@ class DesktopFriend(QObject):
             # Esc로 멈췄을 때 떠 있던 확인 창을 닫는다. 닫히면서 거절로 답한다.
             self._permission.close()
         self.memory.add_message("assistant", message, datetime.now())
+        self.stage.reveal()
         self._say(Reply(message, "excited" if ok else "sad"), aloud=True)
 
     # ---------- 화면 보기 ----------
@@ -605,6 +667,7 @@ class DesktopFriend(QObject):
 
     def _on_screen_noted(self, summary: str, offer: str) -> None:
         """화면을 보고 도울 일이 보이면 가끔 먼저 말을 건다."""
+        self._show_lists()
         per_hour = self._settings.proactive_per_hour
         if not offer or per_hour <= 0 or self._settings.do_not_disturb or self._replying or self._voice_busy:
             return
@@ -627,13 +690,12 @@ class DesktopFriend(QObject):
 
     def _check_alarms(self) -> None:
         for reply in self.tasks.ring_due_alarms(datetime.now()):
+            self.stage.reveal()  # 패널을 숨겨 뒀어도 알람은 보여 준다
+            self._show_lists()
             self._say(reply, aloud=True)
-            # 목소리를 꺼 뒀으면 소리로만 알린다. 방해금지 중에는 말풍선만 띄운다.
+            # 목소리를 꺼 뒀으면 소리로만 알린다. 방해금지 중에는 글로만 알린다.
             if not self._voice_on() and not self._settings.do_not_disturb:
                 self._app.beep()
-
-    def _on_moved(self, position: QPoint) -> None:
-        self._update_settings(position=(position.x(), position.y()))
 
     def _on_do_not_disturb(self, enabled: bool) -> None:
         self._update_settings(do_not_disturb=enabled)
@@ -645,7 +707,7 @@ class DesktopFriend(QObject):
         self._update_settings(tts_enabled=enabled)
         if not enabled:
             self.speaker.stop()
-        self._say(Reply("이제 목소리로도 답할게요." if enabled else "이제 말풍선으로만 답할게요.", "smile"))
+        self._say(Reply("이제 목소리로도 답할게요." if enabled else "이제 글로만 답할게요.", "smile"))
 
     def _on_wake_toggled(self, enabled: bool) -> None:
         self._update_settings(wake_word_enabled=enabled)

@@ -27,6 +27,7 @@ class ChatWorker(QObject):
     finished = Signal(str)  # 다 된 답
     failed = Signal(str)  # 사용자에게 보여 줄 오류 설명
     confirm_needed = Signal(str)  # 해도 되는지 사용자에게 물어볼 일
+    action_taken = Signal(str)  # 실행한 명령이나 검색어. 대화 기록에 한 줄로 남긴다
 
     def __init__(self, session: ChatSession) -> None:
         super().__init__()
@@ -97,6 +98,7 @@ class ChatWorker(QObject):
                     text,
                     on_delta=self.delta.emit,
                     on_tool=self.tool_used.emit,
+                    on_action=self.action_taken.emit,
                     should_stop=lambda: self._cancelled or self._stopping,
                 )
             except EngineError as error:

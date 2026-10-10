@@ -15,7 +15,9 @@ def test_missing_file_gives_defaults(tmp_path):
 
 def test_save_then_load_round_trips(tmp_path):
     path = tmp_path / "nested" / "settings.json"
-    original = Settings(character_height=400, position=(120, 340), do_not_disturb=True)
+    original = Settings(
+        summon_hotkey="Ctrl+Alt+P", props=("ribbon",), panel_position=(120, 340), panel_size=(520, 900), do_not_disturb=True
+    )
 
     save_settings(path, original)
 
@@ -24,9 +26,10 @@ def test_save_then_load_round_trips(tmp_path):
 
 def test_unknown_keys_are_ignored(tmp_path):
     path = tmp_path / "settings.json"
-    path.write_text(json.dumps({"character_height": 250, "removed_option": 1}), encoding="utf-8")
+    # 떠 있는 캐릭터 시절의 설정(position 등)이 남아 있어도 그냥 넘어간다.
+    path.write_text(json.dumps({"do_not_disturb": True, "position": [1, 2], "removed_option": 1}), encoding="utf-8")
 
-    assert load_settings(path).character_height == 250
+    assert load_settings(path).do_not_disturb is True
 
 
 def test_broken_json_is_reported(tmp_path):
@@ -34,15 +37,6 @@ def test_broken_json_is_reported(tmp_path):
     path.write_text("{ not json", encoding="utf-8")
 
     with pytest.raises(SettingsError, match="설정 파일"):
-        load_settings(path)
-
-
-@pytest.mark.parametrize("height", [10, 5000, "big"])
-def test_out_of_range_height_is_rejected(tmp_path, height):
-    path = tmp_path / "settings.json"
-    path.write_text(json.dumps({"character_height": height}), encoding="utf-8")
-
-    with pytest.raises(SettingsError, match="character_height"):
         load_settings(path)
 
 
@@ -67,6 +61,13 @@ def test_screen_watching_defaults_and_block_list_round_trip(tmp_path):
         {"screen_width": "wide"},
         {"blocked_apps": "kakao"},
         {"blocked_apps": [1, 2]},
+        {"panel_position": [1]},
+        {"panel_position": "left"},
+        {"panel_size": [0, 500]},
+        {"panel_size": [300]},
+        {"engine": "chatgpt"},
+        {"gemini_model": ""},
+        {"agy_model": ""},
     ],
 )
 def test_unusable_screen_settings_are_rejected(tmp_path, raw):
@@ -81,4 +82,4 @@ def test_settings_are_immutable():
     settings = Settings()
 
     with pytest.raises(AttributeError):
-        settings.character_height = 1  # type: ignore[misc]
+        settings.do_not_disturb = True  # type: ignore[misc]

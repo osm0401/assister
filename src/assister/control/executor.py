@@ -24,6 +24,7 @@ MAX_WAIT_SEC = 5
 TYPE_GAP_SEC = 0.005
 DOUBLE_CLICK_GAP_SEC = 0.06
 OPEN_POLL_SEC, OPEN_TRIES = 0.2, 20  # 연 프로그램의 창이 뜨기까지 최대 4초 기다린다
+BROWSER_WINDOWS = ("Chrome_WidgetWin_1", "MozillaWindowClass")  # 크롬·엣지·파이어폭스 창의 종류 이름
 
 VIRTUAL_KEYS = {
     "enter": 0x0D, "tab": 0x09, "space": 0x20, "backspace": 0x08, "delete": 0x2E,
@@ -96,15 +97,18 @@ def _key(code: int, flags: int = 0, *, scan: int = 0) -> _Input:
     return _Input(type=INPUT_KEYBOARD, keyboard=_KeyboardInput(code, scan, flags, 0, 0))
 
 
-def _titled_windows() -> list[int]:
-    """화면에 보이고 제목이 있는 창들의 핸들. 앞에 있는 것부터."""
+def _titled_windows() -> dict[int, str]:
+    """화면에 보이고 제목이 있는 창들. 핸들마다 (제목, 창 종류 이름)을 이어 붙인 글을 돌려준다. 앞에 있는 것부터."""
     user32 = ctypes.windll.user32
-    found: list[int] = []
+    found: dict[int, str] = {}
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
     def visit(hwnd, _lparam):
         if user32.IsWindowVisible(hwnd) and user32.GetWindowTextLengthW(hwnd):
-            found.append(hwnd)
+            title, kind = ctypes.create_unicode_buffer(300), ctypes.create_unicode_buffer(100)
+            user32.GetWindowTextW(hwnd, title, len(title))
+            user32.GetClassNameW(hwnd, kind, len(kind))
+            found[hwnd] = f"{title.value}\n{kind.value}"
         return True
 
     user32.EnumWindows(visit, 0)
@@ -160,15 +164,21 @@ class Win32Executor:
         이 앱이 맨 앞이 아닐 때 연 프로그램은 뒤에 뜬다(실제로 재 보니 계산기가 4초 뒤에도 뒤에 있었다).
         그대로 두면 이어지는 글자 입력이 사용자가 쓰던 창으로 들어간다.
         """
-        before = set(_titled_windows())
+        before = _titled_windows()
         os.startfile(name)  # noqa: S606 (무엇을 열어도 되는지는 risk_reason이 먼저 가려낸다)
-        # ponytail: 이미 떠 있던 프로그램이 새 창 없이 받으면(브라우저 탭 등) 앞에 세우지 못한다.
-        # 그런 일이 생기면 프로세스 이름으로 창을 찾는다.
         for _ in range(OPEN_TRIES):
             time.sleep(OPEN_POLL_SEC)
-            new = [hwnd for hwnd in _titled_windows() if hwnd not in before]
-            if new:
-                _bring_forward(new[0])
+            now = _titled_windows()
+            new = [hwnd for hwnd in now if hwnd not in before]
+            # 이미 떠 있던 브라우저는 새 창 없이 탭만 연다. 그때는 제목이 바뀐 브라우저 창이 그 창이다.
+            # ponytail: 그 4초 사이에 다른 브라우저 창의 제목이 바뀌면 그쪽을 앞에 세운다.
+            # 그런 일이 생기면 연 주소의 제목과 맞는지까지 본다.
+            retitled = [
+                hwnd for hwnd, text in now.items()
+                if before.get(hwnd, text) != text and text.rsplit("\n", 1)[-1] in BROWSER_WINDOWS
+            ]  # fmt: skip
+            if new or retitled:
+                _bring_forward((new or retitled)[0])
                 return
 
     def _move(self, point: tuple[int, int]) -> None:

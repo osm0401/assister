@@ -26,6 +26,7 @@ from assister.control.actions import (
     risk_reason,
     to_screen,
 )
+from assister.control.elements import MIN_CHOICES, CHOICE_FORMAT, Choice, Listing, parse_choice
 from assister.screen.capture import Snapshot
 
 log = logging.getLogger(__name__)
@@ -38,6 +39,12 @@ STOPPED = "멈췄어요."
 REFUSED = "알겠어요, 하지 않을게요."
 HIDDEN = "가려 둔 창이 앞에 있어서 대신 조작하지 않을게요."
 OUT_OF_STEPS = "여기까지 해 봤는데 끝내지 못했어요."
+STUCK = "같은 동작만 되풀이하게 돼서 멈췄어요."
+MAX_REPEATS = 3  # 똑같은 동작을 이만큼 잇달아 했으면 그다음에는 하지 않고 멈춘다
+# 잇달아 해도 이상하지 않은 동작. 긴 글을 내리거나 Tab으로 칸을 옮길 때가 그렇다.
+REPEATABLE = ("scroll", "wait", "key")
+SAME_SPOT = 30  # 좌표가 이만큼(천분율) 안에서 다르면 같은 자리로 본다
+TYPE_SETTLE_SEC = 0.15  # 칸을 누르고, 고르고, 글자를 넣는 사이에 두는 틈
 CONFUSED = "어떻게 해야 할지 모르겠어요."
 
 PROMPT = """너는 사용자의 Windows PC를 대신 조작한다. 목표를 이루기 위해 지금 할 동작 하나만 JSON으로 낸다.
@@ -92,9 +99,17 @@ class ControlAgent(QObject):
         width: int,
         max_steps: int,
         settle_sec: float = 0.8,
+        chooser: ChatEngine | None = None,
+        list_elements: Callable[[str], Listing | None] | None = None,
     ) -> None:
+        """chooser와 list_elements를 주면, 화면 그림 대신 누를 수 있는 것의 목록을 보여 주고 번호로 고르게 한다.
+
+        chooser는 그 목록에서 고르는 AI다(글만 읽으면 된다). 목록을 내주지 않는 창에서는 engine이 그림을 보고 조작한다.
+        """
         super().__init__()
         self._engine = engine
+        self._chooser = chooser
+        self._list_elements = list_elements
         self._executor = executor
         self._take_snapshot = take_snapshot
         self._keywords = keywords
@@ -148,6 +163,8 @@ class ControlAgent(QObject):
     def _pursue(self, goal: str) -> tuple[str, bool]:
         history: list[str] = []
         bad_answers = 0
+        last, repeats = None, 0
+        pressed_on: tuple[str, ...] | None = None  # 마지막으로 무언가를 눌렀을 때의 목록
         # 그림 한 장을 읽는 데 몇 초씩 걸려서, 처음에는 지금 쓰는 모니터만 보여 준다.
         # 거기서 못 찾겠다고 하면 그때부터 모든 모니터를 보여 준다.
         widened = 0
@@ -157,6 +174,33 @@ class ControlAgent(QObject):
             snapshot = self._look()
             if snapshot.skipped:
                 return HIDDEN, False
+
+            listing = self._listing(goal)
+            if listing is not None:
+                names = tuple(item.name for item in listing.elements)
+                if names == pressed_on:
+                    history.append("(방금 누른 뒤에도 화면이 그대로다)")
+                pressed_on = None
+                try:
+                    choice = self._choose(goal, history, listing)
+                except ActionError as error:
+                    bad_answers += 1
+                    log.warning("쓸 수 없는 동작: %s", error)
+                    if bad_answers > MAX_BAD_ANSWERS:
+                        return CONFUSED, False
+                    history.append(f"(쓸 수 없는 동작이었다: {error})")
+                    continue
+                outcome = self._carry_out(choice, snapshot, history)
+                if outcome is not None:
+                    return outcome
+                what = (choice.action.kind, choice.name or choice.action.text or choice.action.keys)
+                repeats = repeats + 1 if what == last and choice.action.kind not in REPEATABLE else 0
+                last = what
+                if repeats >= MAX_REPEATS:
+                    return STUCK, False
+                if choice.action.kind == "click":
+                    pressed_on = names
+                continue
 
             monitors = self._executor.monitors()
             in_use = monitor_in_use(snapshot.foreground, monitors)
@@ -192,6 +236,13 @@ class ControlAgent(QObject):
                     continue
                 return action.why or CONFUSED, False
 
+            # 같은 것만 계속 누르면(실제로 12번을 그렇게 다 썼다) 일찍 그만둔다.
+            what = (action.kind, action.target or action.text or (action.x // SAME_SPOT, action.y // SAME_SPOT))
+            repeats = repeats + 1 if what == last and action.kind not in REPEATABLE else 0
+            last = what
+            if repeats >= MAX_REPEATS:
+                return STUCK, False
+
             if action.kind in ("click", "double_click"):
                 point = self._aim_again(action, point, snapshot) or point
 
@@ -205,9 +256,53 @@ class ControlAgent(QObject):
             self.step.emit(action.why)
             self._executor.perform(action, point)
             history.append(describe(action))
+            log.info("조작: %s", history[-1])
             # 화면이 바뀔 틈을 준다. 프로그램을 연 뒤에는 뜨는 데 시간이 더 걸린다. 그동안에도 멈춤은 바로 듣는다.
             self._stop.wait(self._settle_sec * (OPEN_SETTLE_FACTOR if action.kind == "open" else 1))
         return OUT_OF_STEPS, False
+
+    def _listing(self, goal: str) -> Listing | None:
+        """맨 앞 창에서 누를 수 있는 것의 목록. 목록으로 조작할 수 없는 창이면 None(그림 방식으로 한다)."""
+        if self._chooser is None or self._list_elements is None:
+            return None
+        listing = self._list_elements(goal)
+        if listing is None or len(listing.elements) < MIN_CHOICES:
+            log.info("이 창은 누를 수 있는 것을 알려 주지 않아 화면 그림으로 조작합니다")
+            return None
+        return listing
+
+    def _choose(self, goal: str, history: list[str], listing: Listing) -> Choice:
+        """목표와 목록을 주고 AI에게 번호 하나를 고르게 한다. 무엇을 보냈고 무엇을 골랐는지 기록에 남긴다."""
+        log.info(
+            "[맨 앞 창] %s | 누를 수 있는 것 %d개, 화면의 글 %d줄\n%s",
+            listing.window, len(listing.elements), len(listing.texts), listing.lines(),
+        )  # fmt: skip
+        raw = self._chooser.complete_json([{"role": "user", "content": listing.prompt(goal, history)}], CHOICE_FORMAT)
+        choice = parse_choice(raw, listing)
+        log.info("[고른 것] %s %s — %s", choice.action.kind, choice.name or choice.action.text or choice.action.keys, choice.action.why)
+        return choice
+
+    def _carry_out(self, choice: Choice, snapshot: Snapshot, history: list[str]) -> tuple[str, bool] | None:
+        """고른 동작을 실제로 한다. 조작을 끝내야 하면 (마무리 말, 성공 여부)를, 계속하면 None을 돌려준다."""
+        action = choice.action
+        if action.kind == "done":
+            return action.why or "다 했어요.", True
+        if action.kind == "fail":
+            return action.why or CONFUSED, False
+        reasons = [risk_reason(move, element_name=choice.name, foreground=snapshot.foreground) for move, _ in choice.moves]
+        reason = next((reason for reason in [*reasons, "AI가 조심해야 한다고 봄" if action.risky else ""] if reason), "")
+        if reason and not self._ask(f"{action.why} ({reason})"):
+            return (STOPPED if self._stop.is_set() else REFUSED), False
+        if self._stop.is_set():
+            return STOPPED, False
+        self.step.emit(action.why)
+        for move, point in choice.moves:
+            self._executor.perform(move, point)
+            self._stop.wait(TYPE_SETTLE_SEC)
+        history.append(choice.said)
+        log.info("조작: %s", choice.said)
+        self._stop.wait(self._settle_sec * (OPEN_SETTLE_FACTOR if action.kind == "open" else 1))
+        return None
 
     def _aim_again(self, action: Action, point: tuple[int, int], snapshot: Snapshot) -> tuple[int, int] | None:
         """누를 자리가 쓰는 창 밖으로 빗나갔으면, 그 창만 크게 보여 주고 자리를 다시 짚게 한다.

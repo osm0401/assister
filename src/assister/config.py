@@ -6,11 +6,10 @@ import json
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
-MIN_CHARACTER_HEIGHT = 120
-MAX_CHARACTER_HEIGHT = 900
 MIN_NUM_CTX = 2048
 MAX_NUM_CTX = 262144
 STT_DEVICES = ("cuda", "cpu")
+ENGINES = ("ollama", "gemini", "agy")
 INT_RANGES = {
     "screen_interval_sec": (5, 3600),
     "screen_width": (480, 3840),
@@ -30,12 +29,15 @@ class Settings:
     character: str = "default"
     outfit: str = "basic"
     props: tuple[str, ...] = ()  # 걸치고 있는 소품
-    character_height: int = 320
-    position: tuple[int, int] | None = None
+    panel_position: tuple[int, int] | None = None  # 패널을 옮겨 둔 자리. 없으면 화면 왼쪽 1/4
+    panel_size: tuple[int, int] | None = None  # 패널의 바꿔 둔 크기 (너비, 높이). 없으면 화면의 1/4 너비에 전체 높이
     summon_hotkey: str = "Ctrl+Shift+Space"
     do_not_disturb: bool = False
-    always_show_input: bool = True
-    # AI 엔진 (내 PC의 Ollama)
+    # AI 엔진. ollama는 내 PC에서 돌고, gemini는 대화와 화면 그림을 Google 서버로 보낸다.
+    # agy는 Antigravity CLI로 대화만 맡고(느리다), 화면 보기와 PC 조작은 ollama에 남는다.
+    engine: str = "ollama"
+    gemini_model: str = "gemini-3.8-flash"  # API 키는 여기 적지 않고 환경 변수 GEMINI_API_KEY에 둔다
+    agy_model: str = "gemini-3.8-flash-low"  # agy models로 고를 수 있는 이름을 본다
     model: str = "qwen3.5:9b"
     ollama_url: str = "http://localhost:11434"
     num_ctx: int = 16384
@@ -62,27 +64,25 @@ def _validated(raw: dict) -> Settings:
     known = {field.name for field in fields(Settings)}
     values = {key: value for key, value in raw.items() if key in known}
 
-    height = values.get("character_height", Settings.character_height)
-    if isinstance(height, bool) or not isinstance(height, int):
-        raise SettingsError(f"character_height는 정수여야 합니다: {height!r}")
-    if not MIN_CHARACTER_HEIGHT <= height <= MAX_CHARACTER_HEIGHT:
-        raise SettingsError(
-            f"character_height는 {MIN_CHARACTER_HEIGHT}~{MAX_CHARACTER_HEIGHT} 사이여야 합니다: {height}"
-        )
+    for name in ("panel_position", "panel_size"):
+        pair = values.get(name)
+        if pair is None:
+            continue
+        if not (isinstance(pair, (list, tuple)) and len(pair) == 2 and all(type(v) is int for v in pair)):
+            raise SettingsError(f"{name}은(는) 정수 두 개여야 합니다: {pair!r}")
+        if name == "panel_size" and min(pair) <= 0:
+            raise SettingsError(f"panel_size는 0보다 커야 합니다: {pair!r}")
+        values[name] = (pair[0], pair[1])
 
-    position = values.get("position")
-    if position is not None:
-        if not (isinstance(position, (list, tuple)) and len(position) == 2 and all(isinstance(v, int) for v in position)):
-            raise SettingsError(f"position은 [x, y] 형식이어야 합니다: {position!r}")
-        values["position"] = (position[0], position[1])
-
-    for name in ("character", "outfit", "summon_hotkey", "voice_hotkey", "model", "ollama_url", "stt_model"):
+    for name in (
+        "character", "outfit", "summon_hotkey", "voice_hotkey", "model", "ollama_url", "stt_model", "gemini_model",
+        "agy_model",
+    ):  # fmt: skip
         if name in values and (not isinstance(values[name], str) or not values[name].strip()):
             raise SettingsError(f"{name}은(는) 비어 있지 않은 글자여야 합니다: {values[name]!r}")
 
     for name in (
         "do_not_disturb",
-        "always_show_input",
         "tts_enabled",
         "wake_word_enabled",
         "screen_watch_enabled",
@@ -105,6 +105,9 @@ def _validated(raw: dict) -> Settings:
     num_ctx = values.get("num_ctx", Settings.num_ctx)
     if isinstance(num_ctx, bool) or not isinstance(num_ctx, int) or not MIN_NUM_CTX <= num_ctx <= MAX_NUM_CTX:
         raise SettingsError(f"num_ctx는 {MIN_NUM_CTX}~{MAX_NUM_CTX} 사이 정수여야 합니다: {num_ctx!r}")
+
+    if values.get("engine", Settings.engine) not in ENGINES:
+        raise SettingsError(f"engine은 {', '.join(ENGINES)} 중 하나여야 합니다: {values['engine']!r}")
 
     if values.get("stt_device", Settings.stt_device) not in STT_DEVICES:
         raise SettingsError(f"stt_device는 {', '.join(STT_DEVICES)} 중 하나여야 합니다: {values['stt_device']!r}")

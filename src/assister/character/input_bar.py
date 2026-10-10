@@ -1,4 +1,4 @@
-"""캐릭터 옆에 항상 떠 있는 작은 입력창과 마이크 버튼."""
+"""패널 맨 아래의 입력창과 마이크·화면 보기 버튼."""
 
 from __future__ import annotations
 
@@ -6,9 +6,6 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QHBoxLayout, QLineEdit, QPushButton, QWidget
 
-from assister.character.window import FLOATING_FLAGS
-
-BAR_WIDTH = 300
 HEARD_SHOW_MS = 4000
 EDIT_STYLE = """
 QLineEdit {
@@ -63,10 +60,7 @@ class InputBar(QWidget):
     eye_clicked = Signal()
 
     def __init__(self, character_name: str) -> None:
-        super().__init__(None, FLOATING_FLAGS)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setFixedWidth(BAR_WIDTH)
+        super().__init__()
         self._placeholder = f"{character_name}에게 말하기…"
         self.mic_state = "off"
         self.eye_state = "off"
@@ -92,7 +86,6 @@ class InputBar(QWidget):
         layout.addWidget(self._eye)
         self.set_mic_state("off")
         self.set_eye_state("off")
-        self.adjustSize()
 
     @staticmethod
     def _round_button(text: str, clicked: Signal) -> QPushButton:
@@ -111,8 +104,6 @@ class InputBar(QWidget):
 
     def focus_input(self) -> None:
         """단축키나 캐릭터 클릭으로 불렀을 때 바로 글을 칠 수 있게 한다."""
-        self.show()
-        self.raise_()
         self.activateWindow()
         self._edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
 

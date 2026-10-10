@@ -107,7 +107,7 @@ class OllamaEngine:
             "model": self.model,
             "messages": messages,
             "stream": stream,
-            # 생각 과정을 길게 쓰는 기능은 끈다. 말풍선 대화에는 빠른 답이 더 중요하다.
+            # 생각 과정을 길게 쓰는 기능은 끈다. 주고받는 대화에는 빠른 답이 더 중요하다.
             "think": False,
             "keep_alive": self._keep_alive,
             # num_ctx가 요청마다 다르면 Ollama가 모델을 다시 올리므로 늘 같은 값을 보낸다.

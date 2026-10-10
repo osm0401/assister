@@ -8,14 +8,17 @@ Ollama가 꺼져 있으면 켠다. 기억과 할 일은 임시 폴더에만 쓰�
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 
+from assister.ai.agy import AgyEngine
 from assister.ai.chat import ChatSession
 from assister.ai.engine import OllamaEngine, start_ollama
+from assister.ai.gemini import GeminiEngine
 from assister.ai.search import Hit
 from assister.ai.tools import ToolBox
 from assister.memory.store import MemoryStore
@@ -61,9 +64,15 @@ CASES: list[tuple[str, set[str], tuple[str, str] | None]] = [
     ("다운로드 폴더에 뭐 있어?", {"run_command"}, None),
     ("C 드라이브 용량 얼마나 남았어?", {"run_command"}, None),
     ("바탕화면에 있는 old.txt 지워 줘", {"run_command"}, None),
+    ("API를 자세하게 다운로드에 워드 파일로 정리 해줘", {"write_document"}, None),
+    ("파이썬 설치하는 법을 문서로 만들어서 바탕화면에 저장해 줘", {"write_document"}, None),
+    ("김치찌개 끓이는 법을 워드로 정리해 줘", {"write_document"}, None),
+    ("워드 파일에 오늘 있었던일 정리해서 다운로드에 생성해줘", {"write_document"}, None),
+    ("오늘 있었던 일 말해 줘", {"review_day"}, None),
 ]
 FOUND = [Hit("검색 결과", "https://example.com/", "서울은 맑고 낮 최고 21도, 달러 환율은 1,380원")]
 COMMANDS: list[str] = []  # AI가 만든 명령. 실제로 실행하지는 않고 끝에 보여 준다
+DOCUMENTS: list[tuple[str, str]] = []  # AI가 정한 (저장할 곳, 파일 이름). 실제로 저장하지는 않는다
 
 
 def check(engine: OllamaEngine, text: str, expected: set[str], alarm: tuple[str, str] | None) -> tuple[bool, str]:
@@ -81,6 +90,8 @@ def check(engine: OllamaEngine, text: str, expected: set[str], alarm: tuple[str,
             search=lambda query: FOUND,  # 실제 검색은 안 함
             shell=lambda command: COMMANDS.append(command) or CommandResult("메모.txt", 0),
             confirm=lambda text: True,
+            write=lambda topic: "제목\n글",
+            save_document=lambda kind, name, text: DOCUMENTS.append((kind, name)) or Path(f"{name}.docx"),
         )
         used: list[str] = []
         session = ChatSession(engine, memory, toolbox, character_name="모모", clock=lambda: NOW)
@@ -95,7 +106,10 @@ def check(engine: OllamaEngine, text: str, expected: set[str], alarm: tuple[str,
 
 def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
-    engine = OllamaEngine(MODEL, start_server=start_ollama)
+    # ASSISTER_ENGINE=gemini 또는 agy 로 돌리면 그 엔진으로 잰다. agy는 한 마디에 15초쯤 걸린다.
+    chosen = os.environ.get("ASSISTER_ENGINE")
+    engines = {"gemini": GeminiEngine, "agy": AgyEngine}
+    engine = engines[chosen]() if chosen in engines else OllamaEngine(MODEL, start_server=start_ollama)
     engine.warm_up()
     started = time.perf_counter()
     misses = 0
@@ -106,6 +120,8 @@ def main() -> int:
             print(f"X {text}\n    기대: 작업={sorted(expected)} 알람={alarm}\n    실제: {detail}")
     for command in COMMANDS:
         print(f"명령: {command}  ->  {risk_reason(command) or '바로 실행'}")
+    for kind, name in DOCUMENTS:
+        print(f"문서: {name}.docx -> {kind}")
     seconds = (time.perf_counter() - started) / len(CASES)
     print(f"맞음 {len(CASES) - misses}/{len(CASES)}, 한 마디에 평균 {seconds:.1f}초")
     return 1 if misses else 0

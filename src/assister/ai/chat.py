@@ -14,7 +14,7 @@ from datetime import datetime
 
 from assister.ai.engine import ChatEngine
 from assister.ai.prompt import build_planner_prompt, build_system_prompt, outcome_section
-from assister.ai.tools import ACTION_FORMAT, Outcome, ToolBox
+from assister.ai.tools import ACTION_FORMAT, Outcome, ToolBox, action_note
 from assister.memory.store import MemoryStore, Message
 from assister.tasks.commands import spoken_clock, spoken_day_offset
 from assister.tasks.service import format_time
@@ -96,9 +96,13 @@ class ChatSession:
         *,
         on_delta: Callable[[str], None] | None = None,
         on_tool: Callable[[str], None] | None = None,
+        on_action: Callable[[str], None] | None = None,
         should_stop: Callable[[], bool] | None = None,
     ) -> str:
-        """답을 만들어 돌려준다. 엔진이 실패하면 EngineError가 그대로 올라간다."""
+        """답을 만들어 돌려준다. 엔진이 실패하면 EngineError가 그대로 올라간다.
+
+        on_action은 실행한 명령이나 검색어를 사용자에게 보여 줄 한 줄로 받는다.
+        """
         now = self._clock()
         history = self._memory.recent_messages(self._history_limit)
         related = self._memory.search(user_text, limit=RECALL_LIMIT, exclude_recent=self._history_limit)
@@ -107,7 +111,7 @@ class ChatSession:
 
         # 이번에 새로 기억하는 사실은 '방금 알게 된 것'으로 따로 알려 주므로, 그 전에 알던 것만 읽어 둔다.
         facts = [fact.text for fact in self._memory.list_facts()]
-        outcomes = self._act(user_text, history, now, on_tool)
+        outcomes = self._act(user_text, history, now, on_tool, on_action)
 
         confirmations = [outcome.text for outcome in outcomes if outcome.shown]
         if confirmations:
@@ -141,7 +145,12 @@ class ChatSession:
         return text
 
     def _act(
-        self, user_text: str, history: list[Message], now: datetime, on_tool: Callable[[str], None] | None
+        self,
+        user_text: str,
+        history: list[Message],
+        now: datetime,
+        on_tool: Callable[[str], None] | None,
+        on_action: Callable[[str], None] | None = None,
     ) -> list[Outcome]:
         """필요한 작업을 AI에게 고르게 한 뒤 실제로 하고, 작업마다 결과를 돌려준다."""
         recent = [(message.role, message.content) for message in history[-PLANNER_HISTORY_LIMIT:]]
@@ -169,7 +178,13 @@ class ChatSession:
                 continue
             if on_tool:
                 on_tool(name)
-            results.append(self._toolbox.execute(name, _settle_time(action, user_text), now))
+            settled = _settle_time(action, user_text)
+            if name == "write_document":
+                # 무엇을 써 달라고 했는지는 AI가 옮겨 적은 주제보다 사용자가 한 말이 정확하다.
+                settled = {**settled, "request": user_text}
+            if on_action and (note := action_note(name, settled)):
+                on_action(note)
+            results.append(self._toolbox.execute(name, settled, now))
         return results
 
 
